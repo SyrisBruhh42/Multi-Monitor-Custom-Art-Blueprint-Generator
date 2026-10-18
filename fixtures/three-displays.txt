@@ -1,0 +1,28 @@
+Screen 0: minimum 8 x 8, current 4080 x 1920, maximum 32767 x 32767
+LEFT connected primary 1080x1920+0+0 (0xabc) left (normal left inverted right x axis y axis) 527mm x 296mm
+    CRTC: 1
+    Transform: 1 0 0
+  0 1 0
+  0 0 1
+
+  1920x1080 (0xabc) 100.0MHz +HSync +VSync *current
+        h: width 1920 start 1 end 2 total 3
+        v: height 1080 start 1 end 2 total 3 clock 60.00Hz
+CENTRE connected primary 1920x1080+1080+840 (0xabc) normal (normal left inverted right x axis y axis) 600mm x 340mm
+    CRTC: 0
+    Transform: 1 0 0
+  0 1 0
+  0 0 1
+
+  1920x1080 (0xabc) 100.0MHz +HSync +VSync *current
+        h: width 1920 start 1 end 2 total 3
+        v: height 1080 start 1 end 2 total 3 clock 180.00Hz
+RIGHT connected primary 1080x1920+3000+0 (0xabc) right (normal left inverted right x axis y axis) 527mm x 296mm
+    CRTC: 2
+    Transform: 1 0 0
+  0 1 0
+  0 0 1
+
+  1920x1080 (0xabc) 100.0MHz +HSync +VSync *current
+        h: width 1920 start 1 end 2 total 3
+        v: height 1080 start 1 end 2 total 3 clock 60.00Hz

@@ -1,0 +1,3 @@
+# PDF generation only. The collector and geometry tests use Python standard library.
+# Acceptance used reportlab 4.4.9. Packaging must include dependency/font licenses.
+reportlab>=4.4.9,<5
