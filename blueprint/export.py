@@ -4,7 +4,7 @@ from hashlib import sha256
 from html import escape
 from math import ceil
 import json,uuid
-from .core import canonical_json,prompts,CaptureError
+from .core import canonical_json,prompts,CaptureError,validate_manifest_backend
 
 PALETTE=['#287B8E','#7756A3','#B76E29','#4D8664']
 
@@ -17,6 +17,7 @@ def svg(manifest):
     return '\n'.join(shapes+['</svg>'])
 
 def write_pdf(path,manifest):
+    validate_manifest_backend(manifest)
     from reportlab.platypus import SimpleDocTemplate,Paragraph,Spacer,Table,TableStyle,PageBreak,Preformatted,Flowable
     from reportlab.lib import colors
     from reportlab.lib.styles import getSampleStyleSheet,ParagraphStyle
@@ -36,6 +37,7 @@ def write_pdf(path,manifest):
     styles['Title'].textColor=colors.HexColor('#16324B'); styles['Heading1'].textColor=colors.HexColor('#16324B')
     story=[]
     is_windows=manifest['canvas']['unit']=='windows_virtual_desktop_physical_px'
+    legacy=is_windows and manifest['capture']['windows_query']['query_flags']==2
     def p(text,style='BodyBrief'): return Paragraph(escape(str(text)).replace('\n','<br/>'),styles[style])
     def add(text,style='BodyBrief'): story.append(p(text,style))
     def table(rows,widths):
@@ -55,19 +57,23 @@ def write_pdf(path,manifest):
     add('Your display-aware art brief','Title')
     add('OFFLINE CAPTURE PROPOSAL  |  Searchable, self-contained AI handoff','SmallBrief')
     add(f'Capture: {manifest["capture"]["utc"]}. Overall result: PARTIAL. Digital geometry: {manifest["capture"]["display_geometry"]}. Window geometry: {manifest["window_geometry"]["status"]}.')
+    if legacy:
+        add('Desktop layout captured. Exact per-screen crops are unavailable.','Heading2')
+        add('This brief contains observed desktop regions and anonymous window bounds. Virtual display mapping, physical screen placement and exact panel outputs remain unknown. Backend: WINDOWS_LEGACY_DESKTOP_LAYOUT, query flags 2.','SmallBrief')
     if is_windows:
         add('Evidence: '+manifest['capture']['snapshot_coherence']['status']+'. Native Windows device qualification remains separate.','SmallBrief')
     w,h=manifest['canvas']['size']; a,b=manifest['canvas']['aspect_ratio']
     add(f'{len(manifest["displays"])} displays - {w} x {h} shared canvas','Heading1')
     add(f'Shared master aspect ratio: {a}:{b}. Diagram preserves desktop proportions.','SmallBrief')
     story.append(Diagram())
-    rows=[['Display','Desktop x, y','Upright pixels','Rotation','Upright size mm (reported)']]
+    rows=[['Display','Desktop x, y','Reported target px (unqualified)' if legacy else 'Upright pixels','Rotation','Upright size mm (reported)']]
     for d in manifest['displays']:
         r=d['desktop_rect']['xywh']; mm=d['reported_physical_mm']['oriented_axes']
-        rows.append([d['id']+(' (primary)' if d['primary'] else ''),f'{r[0]}, {r[1]}',' x '.join(map(str,d['oriented_output_px'])) if d['oriented_output_px'] else 'Unknown',str(d['rotation_deg'])+' deg' if d['rotation_deg'] is not None else 'Unknown',' x '.join(map(str,mm)) if mm else 'Unknown'])
+        reported=d['windows']['target_signal_active_px'] if legacy else d['oriented_output_px']
+        rows.append([d['id']+(' (primary)' if d['primary'] else ''),f'{r[0]}, {r[1]}',' x '.join(map(str,reported)) if reported else 'Unknown',str(d['rotation_deg'])+' deg' if d['rotation_deg'] is not None else 'Unknown',' x '.join(map(str,mm)) if mm else 'Unknown'])
     table(rows,[76,100,100,70,144]); story.append(Spacer(1,10))
     add('What is known','Heading2'); add('Windows source rectangles use physical desktop pixels under verified per-monitor awareness. Reported UI scale is separate from source-to-target display scaling. Physical millimeters, client/backing geometry and raw panel transforms remain unknown. Native Windows device qualification is still required.' if is_windows else 'Desktop rectangles, current scanout modes and orientation come from the operating system. Portrait physical axes are rotated once. Physical sizes are reported values, not ruler measurements. Logical UI scale, backing pixels, bezel width, desk gaps, monitor angles and the viewer position remain distinct or unknown.')
-    add('What this file contains','Heading2'); add('Exact digital mapping and mask rules, still and motion prompts, source limitations, and every canonical JSON character in a searchable text appendix. No screenshot, window title, display serial, raw EDID or private file path is included.')
+    add('What this file contains','Heading2'); add(('Observed desktop regions, unresolved panel mappings and composition rules,' if legacy else 'Exact digital mapping and mask rules,')+' still and motion prompts, source limitations, and every canonical JSON character in a searchable text appendix. No screenshot, window title, display serial, raw EDID or private file path is included.')
     story.append(PageBreak())
     add('Windows and desktop work area','Heading1')
     windows=manifest['window_geometry']
@@ -92,16 +98,23 @@ def write_pdf(path,manifest):
     story.append(PageBreak())
     add('Geometry and output contract','Title')
     add(manifest['canvas']['coordinate_rule']); add('Source desktop origin: '+str(manifest['canvas']['source_origin'])+'. Normalize by subtracting this one shared origin from every display. Units: '+manifest['canvas']['unit']+'.')
-    rows=[['Display','Master crop [x,y,w,h]','Output size','Mapping']]
+    rows=[['Display','Desktop region [x,y,w,h]' if legacy else 'Master crop [x,y,w,h]','Panel output' if legacy else 'Output size','Mapping']]
     for d in manifest['displays']:
-        rows.append([d['id'],str(d['normalized_rect']['xywh']),str(d['oriented_output_px']),d['mapping_status']])
+        rows.append([d['id'],str(d['normalized_rect']['xywh']),str(d['oriented_output_px']) if d['oriented_output_px'] else 'Unknown',d['mapping_status']])
     table(rows,[50,175,100,165]); story.append(Spacer(1,10))
     add('Crop and scaling rules','Heading2')
     for key in ['fit_rule','mask_rule','motion_rule','focus_rule']: add(manifest['media_contract'][key])
-    add('Per-display affine transforms','Heading2'); add('The JSON records six row-major affine coefficients [a,b,c,d,e,f] as exact [numerator,denominator] pairs: output_x=a*master_x+b*master_y+c; output_y=d*master_x+e*master_y+f. Inputs are normalized MASTER coordinates. Translation terms already subtract the crop origin; do not subtract it again before applying this affine. Global desktop positions are never multiplied by per-monitor UI scale. Unknown transforms have no exact crop contract.')
-    add('Example: a crop at [1920,0,1920,1080] mapped to [3840,2160] has [2,0,-3840,0,2,0]. Master point [1920,0] maps to output [0,0], and [3840,1080] maps to [3840,2160]. If working with local crop offsets instead, apply only the scale [2,2], without that translation.','SmallBrief')
-    add('Visible and unused mask','Heading2'); add('Visible disjoint rectangles: '+json.dumps(manifest['active_mask_disjoint_rects'])+'.'); add('Unused canvas rectangles: '+json.dumps(manifest['unused_canvas_rects'])+'.')
+    if legacy:
+        add('Per-display affine transforms','Heading2')
+        add('No per-display affine transforms or exact panel crops are supplied by this desktop-layout backend. Panel output dimensions and virtual-image mapping remain unknown. Shared desktop positions are never multiplied by per-monitor UI scale.')
+    else:
+        add('Per-display affine transforms','Heading2'); add('The JSON records six row-major affine coefficients [a,b,c,d,e,f] as exact [numerator,denominator] pairs: output_x=a*master_x+b*master_y+c; output_y=d*master_x+e*master_y+f. Inputs are normalized MASTER coordinates. Translation terms already subtract the crop origin; do not subtract it again before applying this affine. Global desktop positions are never multiplied by per-monitor UI scale. Unknown transforms have no exact crop contract.')
+        add('Example: a crop at [1920,0,1920,1080] mapped to [3840,2160] has [2,0,-3840,0,2,0]. Master point [1920,0] maps to output [0,0], and [3840,1080] maps to [3840,2160]. If working with local crop offsets instead, apply only the scale [2,2], without that translation.','SmallBrief')
+    add('Desktop regions and unused canvas' if legacy else 'Visible and unused mask','Heading2'); add(('OS-reported disjoint desktop regions: ' if legacy else 'Visible disjoint rectangles: ')+json.dumps(manifest['active_mask_disjoint_rects'])+'.'); add('Unused canvas rectangles: '+json.dumps(manifest['unused_canvas_rects'])+'.')
     add('Mirroring and overlap','Heading2'); add(json.dumps(manifest['clone_groups']) if manifest['clone_groups'] else 'No clone relation was confirmed by this collector. Overlap alone is never called mirroring.'); add('All overlap records and the explicitly unknown raw panel transform are preserved in the appendix.' if is_windows else 'All overlap records and native-panel rotation transforms are preserved in the appendix.')
+    if legacy:
+        add('Sources checked 2026-10-18','Heading2')
+        add('\n'.join(manifest['prompts']['sources']+['https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-querydisplayconfig','https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindowrect','https://learn.microsoft.com/en-us/windows/win32/api/shellscalingapi/nf-shellscalingapi-getscalefactorformonitor']),'SmallBrief')
     story.append(PageBreak())
     prompt=manifest['prompts']; add('Ready-to-copy creative prompts','Title')
     add('Shared master still','Heading2'); add(prompt['midjourney_still'] or 'The canvas exceeds the supported aspect policy. Do not silently truncate or substitute a different layout.')
@@ -110,16 +123,17 @@ def write_pdf(path,manifest):
     add('Provider limits','Heading2'); add(prompt['provider_limits']); add('Templates only: no images or video have been generated, uploaded, purchased, decoded or applied to a desktop. Aspect ratio is not a guarantee of exact output dimensions. A loop flag is not evidence of perceptually seamless motion.')
     add('Remaining product gates','Heading2')
     for item in manifest['remaining_gates']: add('- '+item,'SmallBrief')
-    add('Sources checked 2026-10-18','Heading2')
-    for url in prompt['sources']: add(url,'SmallBrief')
-    if is_windows:
-        add('Windows topology: https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-querydisplayconfig','SmallBrief')
-        add('Window bounds: https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindowrect','SmallBrief')
-        add('Per-monitor scale: https://learn.microsoft.com/en-us/windows/win32/api/shellscalingapi/nf-shellscalingapi-getscalefactorformonitor','SmallBrief')
-    else:
-        add('EWMH: https://specifications.freedesktop.org/wm/latest-single/','SmallBrief')
-        add('Xlib: https://xorg.freedesktop.org/archive/current/doc/libX11/libX11/libX11.html','SmallBrief')
-        add('XRandR protocol: https://xorg.freedesktop.org/archive/current/doc/randrproto/randrproto.txt','SmallBrief')
+    if not legacy:
+        add('Sources checked 2026-10-18','Heading2')
+        for url in prompt['sources']: add(url,'SmallBrief')
+        if is_windows:
+            add('Windows topology: https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-querydisplayconfig','SmallBrief')
+            add('Window bounds: https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindowrect','SmallBrief')
+            add('Per-monitor scale: https://learn.microsoft.com/en-us/windows/win32/api/shellscalingapi/nf-shellscalingapi-getscalefactorformonitor','SmallBrief')
+        else:
+            add('EWMH: https://specifications.freedesktop.org/wm/latest-single/','SmallBrief')
+            add('Xlib: https://xorg.freedesktop.org/archive/current/doc/libX11/libX11/libX11.html','SmallBrief')
+            add('XRandR protocol: https://xorg.freedesktop.org/archive/current/doc/randrproto/randrproto.txt','SmallBrief')
     story.append(PageBreak())
     add('Complete canonical JSON','Title')
     canonical=canonical_json(manifest)
@@ -142,6 +156,7 @@ def write_pdf(path,manifest):
     SimpleDocTemplate(str(path),pagesize=A4,leftMargin=42,rightMargin=42,topMargin=38,bottomMargin=48,title='Display-aware art brief',author='Display Blueprint',subject='Synthetic geometry and AI wallpaper handoff').build(story,onFirstPage=footer,onLaterPages=footer)
 
 def write_bundle(directory,manifest):
+    validate_manifest_backend(manifest)
     directory=Path(directory); directory.mkdir(parents=True,exist_ok=True)
     token=uuid.uuid4().hex[:12]; staging=directory/('.partial-'+token); staging.mkdir()
     try:

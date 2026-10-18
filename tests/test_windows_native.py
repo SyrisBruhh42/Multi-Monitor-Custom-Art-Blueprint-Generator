@@ -19,7 +19,7 @@ class Fake:
     def enter_dpi(self):self.events.append('enter');return 123
     def verify_dpi(self):self.events.append('verify');return self.verified
     def restore_dpi(self,old):self.events.append(('restore',old))
-    def displays(self):
+    def displays(self,query_flags=None):
         self.events.append('displays')
         if self.failure:raise self.failure
         return [],[]
@@ -493,7 +493,100 @@ def native_probe(destination):
     print(json.dumps(result,separators=(',',':')))
     return exit_code
 
+def native_desktop_probe(destination):
+    """Actual limited desktop geometry has its own gate; exact mapping stays held."""
+    from blueprint.windows import desktop_capture,bounded_worker
+    result={'kind':'NATIVE_WINDOWS_DESKTOP_LAYOUT_PARTIAL_QUALIFICATION','os':platform.system(),
+      'os_release':platform.release(),'architecture':platform.machine(),'python':platform.python_version(),
+      'native_desktop_layout':'NOT_RUN','exact_panel_capture':'NOT_QUALIFIED',
+      'strict_aware_capture':'SEPARATE_GATE_UNCHANGED','device_matrix':'NOT_RUN','portable_distribution':'NOT_BUILT'}
+    exit_code=2
+    try:
+        if sys.platform!='win32':raise CaptureError('WINDOWS_NATIVE_PLATFORM_REQUIRED')
+        n.validate_abi();result['abi']='PASS_NATIVE_WINDOWS_STRUCT_LAYOUT'
+        def query(**kwargs):
+            return bounded_worker(command=[sys.executable,'-B','-m','blueprint.windows_native','--desktop-layout'],**kwargs)
+        snapshot=desktop_capture(query=query)
+        manifest=normalize(snapshot,datetime.now(timezone.utc).isoformat(),os_family='Windows',session='windows_desktop')
+        result.update(windows_query=manifest['capture']['windows_query'],schema_version=manifest['schema_version'],
+          desktop_layout=manifest['capture']['desktop_layout'],display_count=len(manifest['displays']),
+          display_geometry=manifest['capture']['display_geometry'],windows=manifest['window_geometry']['status'],
+          window_count=len(manifest['window_geometry']['items'] or []),
+          frame_bounds_count=sum(w['frame_rect'] is not None for w in manifest['window_geometry']['items'] or []),
+          coherence=manifest['capture']['snapshot_coherence']['status'],source_errors=manifest['capture']['source_errors'],
+          exact_crops_available=manifest['media_contract']['exact_crops_available'],
+          canonical_manifest_sha256=hashlib.sha256(canonical_json(manifest).encode()).hexdigest())
+        expected_errors={'WINDOWS_VIRTUAL_MODE_SUPPORT_UNKNOWN','WINDOWS_CROP_MAPPING_UNRESOLVED'}
+        if (result['desktop_layout']=='OBSERVED_COHERENT' and result['display_count']>0 and
+            result['display_geometry']=='INCOMPLETE' and result['windows']=='CAPTURED_TOPLEVEL_WINDOWS' and
+            result['frame_bounds_count']>0 and result['coherence']=='TWO_MATCHING_SNAPSHOTS' and
+            set(result['source_errors'])==expected_errors and result['exact_crops_available'] is False):
+            result['native_desktop_layout']='PASS_BOUNDED_RUNNER_DESKTOP_LAYOUT_PARTIAL';exit_code=0
+        else:result['native_desktop_layout']='UNQUALIFIED_INCOMPLETE_OBSERVATION'
+    except CaptureError as error:result.update(native_desktop_layout='UNQUALIFIED_UNAVAILABLE',code=error.code)
+    except Exception:result.update(native_desktop_layout='FAILED',code='NATIVE_PROBE_UNEXPECTED_FAILURE')
+    Path(destination).write_text(json.dumps(result,indent=2)+'\n',encoding='utf-8')
+    print(json.dumps(result,separators=(',',':')))
+    return exit_code
+
+class LegacyNativeContract(unittest.TestCase):
+    def test_collect_passes_explicit_policy_and_restores_context(self):
+        class API(Fake):
+            def displays(self,query_flags=None):self.events.append(('query_flags',query_flags));return [],[]
+        for flags,policy in n.QUERY_POLICIES.items():
+            api=API();raw=n.collect(api,query_flags=flags)
+            self.assertIn(('query_flags',flags),api.events);self.assertEqual(api.events[-1],('restore',123))
+            self.assertEqual(raw['query_flags'],flags);self.assertEqual(raw['query_policy'],policy)
+        api=API()
+        for value in (True,None,'2',0,3):
+            with self.assertRaises(CaptureError):n.collect(api,query_flags=value)
+        self.assertEqual(api.events,[])
+    def test_both_native_calls_receive_legacy_flags_without_global_mutation(self):
+        api=n.Native.__new__(n.Native);calls=[]
+        def sizes(flags,paths,modes):calls.append(('sizes',flags));paths._obj.value=1;modes._obj.value=2;return 0
+        def query(flags,*_):calls.append(('query',flags));return 5
+        api.user=SimpleNamespace(GetDisplayConfigBufferSizes=sizes,QueryDisplayConfig=query)
+        with self.assertRaises(CaptureError):api.displays(query_flags=2)
+        self.assertEqual(calls,[('sizes',2),('query',2)]);self.assertEqual(n.FLAGS,18)
+    def test_worker_command_selects_only_valid_policy(self):
+        for args,flags in (([],18),(['--desktop-layout'],2)):
+            with patch.object(n,'Native',return_value=Fake()),redirect_stdout(io.StringIO()) as out:n.main(args)
+            self.assertEqual(json.loads(out.getvalue())['query_flags'],flags)
+        with patch.object(n,'Native') as native,redirect_stdout(io.StringIO()) as out:n.main(['--unknown'])
+        native.assert_not_called();self.assertEqual(json.loads(out.getvalue())['code'],'WINDOWS_QUERY_POLICY_INVALID')
+    def probe(self,raw):
+        with TemporaryDirectory() as tmp,patch.object(sys,'platform','win32'),patch('blueprint.windows.bounded_worker',return_value=json.dumps(raw)) as query,redirect_stdout(io.StringIO()):
+            target=Path(tmp)/'result.json';exit_code=native_desktop_probe(target);return exit_code,json.loads(target.read_text()),query
+    def test_actual_probe_path_accepts_only_no_crop_partial_contract(self):
+        from test_windows_platform import legacy_fixture
+        exit_code,result,query=self.probe(legacy_fixture())
+        self.assertEqual(exit_code,0);self.assertEqual(result['native_desktop_layout'],'PASS_BOUNDED_RUNNER_DESKTOP_LAYOUT_PARTIAL')
+        self.assertEqual(result['exact_panel_capture'],'NOT_QUALIFIED');self.assertFalse(result['exact_crops_available'])
+        self.assertEqual(result['strict_aware_capture'],'SEPARATE_GATE_UNCHANGED');self.assertEqual(result['display_geometry'],'INCOMPLETE')
+        self.assertNotIn('PRIVATE',json.dumps(result));self.assertNotIn('987654321123',json.dumps(result))
+        for call in query.call_args_list:self.assertEqual(call.kwargs['command'][-1],'--desktop-layout')
+    def test_unavailable_legacy_native_gate_is_nonzero_not_skipped(self):
+        raw={'status':'UNAVAILABLE','code':'WINDOWS_DESKTOP_ACCESS_UNAVAILABLE'}
+        exit_code,result,query=self.probe(raw)
+        self.assertEqual(exit_code,2);self.assertEqual(result['native_desktop_layout'],'UNQUALIFIED_UNAVAILABLE');self.assertEqual(query.call_count,1)
+    def test_native_partial_missing_frames_scale_windows_do_not_qualify(self):
+        from test_windows_platform import legacy_fixture
+        for change in (lambda r:r['windows'].update(items=[]),lambda r:r['windows']['items'][0].update(frame_rect=None),
+                       lambda r:r['monitors'][0].update(scale_percent=None),lambda r:r.update(windows={'status':'UNAVAILABLE'})):
+            raw=legacy_fixture();change(raw);exit_code,result,_=self.probe(raw)
+            self.assertEqual(exit_code,2);self.assertEqual(result['native_desktop_layout'],'UNQUALIFIED_INCOMPLETE_OBSERVATION')
+    def test_wrong_policy_and_original_index_failure_cannot_pass_native_partial(self):
+        from test_windows_platform import fixture,legacy_fixture
+        for raw in (fixture(),legacy_fixture()):
+            if raw['query_flags']==2:raw['paths'][0]['source_index']=131071
+            exit_code,result,_=self.probe(raw)
+            self.assertEqual(exit_code,2);self.assertEqual(result['native_desktop_layout'],'UNQUALIFIED_UNAVAILABLE')
+    def test_nonwindows_native_partial_never_calls_worker(self):
+        with TemporaryDirectory() as tmp,patch.object(sys,'platform','linux'),patch('blueprint.windows.bounded_worker') as query,redirect_stdout(io.StringIO()):
+            self.assertEqual(native_desktop_probe(Path(tmp)/'result.json'),2);query.assert_not_called()
+
 if __name__=='__main__':
+    if len(sys.argv)==3 and sys.argv[1]=='--native-desktop-readonly':sys.exit(native_desktop_probe(sys.argv[2]))
     if len(sys.argv)==4 and sys.argv[1]=='--sdk-readonly':sys.exit(sdk_probe(sys.argv[2],sys.argv[3]))
     if len(sys.argv)==2 and sys.argv[1]=='--structural-compare':comparative_child();sys.exit(0)
     if len(sys.argv)==3 and sys.argv[1]=='--native-readonly':sys.exit(native_probe(sys.argv[2]))

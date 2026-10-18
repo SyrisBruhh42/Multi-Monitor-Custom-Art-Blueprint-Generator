@@ -14,7 +14,8 @@ I32=C.c_int32
 U64=C.c_uint64
 HANDLE=C.c_void_p
 CALLBACK=getattr(C,'WINFUNCTYPE',C.CFUNCTYPE)
-FLAGS=0x12  # ONLY_ACTIVE_PATHS | VIRTUAL_MODE_AWARE
+FLAGS=0x12  # Strict qualification keeps ONLY_ACTIVE_PATHS | VIRTUAL_MODE_AWARE
+QUERY_POLICIES={2:"WINDOWS_LEGACY_DESKTOP_LAYOUT",18:"WINDOWS_VIRTUAL_AWARE_STRICT"}
 MAX_PATHS=64
 MAX_MODES=192
 MAX_WINDOWS=256
@@ -121,15 +122,17 @@ class Native:
         if not self.user.SetThreadDpiAwarenessContext(old):raise CaptureError('WINDOWS_DPI_RESTORE_FAILED')
         if not self.user.AreDpiAwarenessContextsEqual(self.user.GetThreadDpiAwarenessContext(),old):raise CaptureError('WINDOWS_DPI_RESTORE_FAILED')
 
-    def displays(self):
+    def displays(self,query_flags=None):
+        query_flags=FLAGS if query_flags is None else query_flags
+        if type(query_flags) is not int or query_flags not in QUERY_POLICIES:raise CaptureError("WINDOWS_QUERY_POLICY_INVALID")
         for _ in range(3):
             np=U32();nm=U32()
-            code=self.user.GetDisplayConfigBufferSizes(FLAGS,C.byref(np),C.byref(nm))
+            code=self.user.GetDisplayConfigBufferSizes(query_flags,C.byref(np),C.byref(nm))
             if code:raise CaptureError(query_error(code))
             if not 0<np.value<=MAX_PATHS or not 0<nm.value<=MAX_MODES:raise CaptureError('WINDOWS_DISPLAY_COUNT_LIMIT')
             path_capacity=np.value;mode_capacity=nm.value
             paths=(DisplayPath*path_capacity)();modes=(Mode*mode_capacity)()
-            code=self.user.QueryDisplayConfig(FLAGS,C.byref(np),paths,C.byref(nm),modes,None)
+            code=self.user.QueryDisplayConfig(query_flags,C.byref(np),paths,C.byref(nm),modes,None)
             if code==122:continue
             if code:raise CaptureError(query_error(code))
             if not 0<np.value<=path_capacity or not 0<nm.value<=mode_capacity:raise CaptureError('WINDOWS_DISPLAY_COUNT_LIMIT')
@@ -196,20 +199,24 @@ class Native:
         if not success:raise CaptureError('WINDOWS_WINDOW_QUERY_FAILED')
         return {'status':'CAPTURED_TOPLEVEL_WINDOWS','items':result}
 
-def collect(api):
+def collect(api,query_flags=FLAGS):
+    if type(query_flags) is not int or query_flags not in QUERY_POLICIES:raise CaptureError("WINDOWS_QUERY_POLICY_INVALID")
     old=api.enter_dpi()
     try:
         if not api.verify_dpi():raise CaptureError('WINDOWS_DPI_CONTEXT_UNAVAILABLE')
-        paths,modes=api.displays();monitors=api.monitors()
+        paths,modes=api.displays(query_flags=query_flags);monitors=api.monitors()
         try:windows=api.windows()
         except Exception:windows={'status':'UNAVAILABLE','code':'WINDOWS_WINDOW_QUERY_FAILED'}
         if not api.verify_dpi():raise CaptureError('WINDOWS_DPI_CONTEXT_UNAVAILABLE')
-        return {'status':'CAPTURED','dpi_context_verified':True,'paths':paths,'modes':modes,'monitors':monitors,'windows':windows}
+        return {'status':'CAPTURED','query_flags':query_flags,'query_policy':QUERY_POLICIES[query_flags],'dpi_context_verified':True,'paths':paths,'modes':modes,'monitors':monitors,'windows':windows}
     finally:api.restore_dpi(old)
 
-ERROR_CODES=frozenset(('WINDOWS_NATIVE_PLATFORM_REQUIRED','WINDOWS_ABI_UNQUALIFIED','WINDOWS_API_UNSUPPORTED','WINDOWS_DPI_CONTEXT_UNAVAILABLE','WINDOWS_DPI_RESTORE_FAILED','WINDOWS_DESKTOP_ACCESS_UNAVAILABLE','WINDOWS_DRIVER_UNSUPPORTED','WINDOWS_DISPLAY_QUERY_FAILED','WINDOWS_DISPLAY_COUNT_LIMIT','WINDOWS_TOPOLOGY_CHANGED','WINDOWS_SOURCE_JOIN_UNAVAILABLE','WINDOWS_MONITOR_QUERY_FAILED'))
-def main():
-    try:value=collect(Native())
+ERROR_CODES=frozenset(('WINDOWS_QUERY_POLICY_INVALID','WINDOWS_NATIVE_PLATFORM_REQUIRED','WINDOWS_ABI_UNQUALIFIED','WINDOWS_API_UNSUPPORTED','WINDOWS_DPI_CONTEXT_UNAVAILABLE','WINDOWS_DPI_RESTORE_FAILED','WINDOWS_DESKTOP_ACCESS_UNAVAILABLE','WINDOWS_DRIVER_UNSUPPORTED','WINDOWS_DISPLAY_QUERY_FAILED','WINDOWS_DISPLAY_COUNT_LIMIT','WINDOWS_TOPOLOGY_CHANGED','WINDOWS_SOURCE_JOIN_UNAVAILABLE','WINDOWS_MONITOR_QUERY_FAILED'))
+def main(argv=None):
+    args=sys.argv[1:] if argv is None else argv
+    try:
+        if args not in ([],['--desktop-layout']):raise CaptureError('WINDOWS_QUERY_POLICY_INVALID')
+        value=collect(Native(),query_flags=2 if args else FLAGS)
     except CaptureError as error:value={'status':'UNAVAILABLE','code':error.code if error.code in ERROR_CODES else 'WINDOWS_DISPLAY_QUERY_FAILED'}
     except Exception:value={'status':'UNAVAILABLE','code':'WINDOWS_DISPLAY_QUERY_FAILED'}
     encoded=json.dumps(value,separators=(',',':'),allow_nan=False)

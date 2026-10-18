@@ -1,17 +1,22 @@
 """Windows-only allowlisted geometry. No X11 semantics are inferred."""
 from .core import CaptureError,rect,dimensions
 from .window_geometry import intersection,normalized
-from .windows import UNIT,SCALING,SCALES,boolean,u32,fraction
+from .windows import UNIT,SCALING,SCALES,boolean,u32,fraction,query_policy
 
-def display_fields(observation,origin):
+def display_fields(observation,origin,policy):
     data=observation.get('_windows')
     if not isinstance(data,dict):raise CaptureError('WINDOWS_MALFORMED_OBSERVATION')
+    if query_policy(data)!=query_policy(policy):raise CaptureError('WINDOWS_QUERY_POLICY_MISMATCH')
+    legacy=policy['query_flags']==2
+    virtual=data.get('virtual_mode_aware_path')
+    if legacy and virtual is not None:raise CaptureError('WINDOWS_QUERY_POLICY_MISMATCH')
+    if not legacy:boolean(virtual)
     scale=data.get('ui_scale_percent')
     if scale is not None and (type(scale) is not int or scale not in SCALES):raise CaptureError('WINDOWS_MALFORMED_OBSERVATION')
     work=rect(data.get('work_area'));image=data.get('desktop_image')
     if image is not None:
         image={'path_size':dimensions(image.get('path_size')),'region':rect(image.get('region')),'clip':rect(image.get('clip'))}
-    return {
+    result={
       'logical_rect_reason':'No unified UI-logical desktop is inferred from per-monitor scaling; desktop coordinates are PMv2/CCD physical pixels.',
       'ui_scale':[scale,100] if scale is not None else None,
       'ui_scale_reason':None if scale is not None else 'GetScaleFactorForMonitor unavailable, failed or returned an unqualified value; no 96dpi fallback.',
@@ -19,9 +24,9 @@ def display_fields(observation,origin):
       'refresh_source':'CCD target signal vertical frequency, progressive/no divider/no dynamic-rate flag only; not measured playback',
       'oriented_to_native_pixel_edge_affine':None,
       'native_panel_mapping_reason':'CCD clockwise rotation is retained; raw panel-axis transform has not been independently qualified.',
-      'windows':{'rotation_convention':'CCD_CLOCKWISE','path_scaling':data.get('path_scaling') if data.get('path_scaling') in SCALING.values() else 'unknown',
+      'windows':{**policy,'virtual_mode_awareness':'NOT_REQUESTED' if legacy else 'REQUESTED','rotation_convention':'CCD_CLOCKWISE','path_scaling':data.get('path_scaling') if data.get('path_scaling') in SCALING.values() else 'unknown',
         'target_signal_active_px':dimensions(data.get('target_signal_active_px')),'desktop_image':image,
-        'virtual_mode_aware_path':boolean(data.get('virtual_mode_aware_path')),
+        'virtual_mode_aware_path':virtual,'virtual_mode_reason':'NOT_QUERIED_BY_LEGACY_POLICY' if legacy else None,
         'target_refresh_rational':fraction(data['target_refresh_rational']) if data.get('target_refresh_rational') else None,
         'path_refresh_rational':fraction(data['path_refresh_rational']) if data.get('path_refresh_rational') else None,
         'scanline_ordering':u32(data['scanline_ordering']) if data.get('scanline_ordering') is not None else None,
@@ -29,6 +34,12 @@ def display_fields(observation,origin):
         'dynamic_refresh_flag':boolean(data.get('dynamic_refresh_flag')),
         'scale_source':'GetScaleFactorForMonitor S_OK' if scale else None,
         'work_area':{'source_xywh':work,'normalized_xywh':normalized(work,origin),'unit':UNIT,'source':'GetMonitorInfoW.rcWork'}}}
+    if legacy:
+        result.update(scanout_mode_px=None,oriented_output_px=None,refresh_millihz=None,
+          scanout_mode_reason='Legacy target signal is retained as reported metadata only; physical panel mapping is unknown.',
+          refresh_source='Legacy timing rationals retained as reported metadata only; no refresh qualification.',
+          mapping_reason='Legacy desktop policy does not query virtual-image mapping; no exact panel crop is qualified.')
+    return result
 
 def normalize_windows(raw,canvas,displays):
     if canvas['unit']!=UNIT:raise CaptureError('WINDOW_COORDINATE_MISMATCH')

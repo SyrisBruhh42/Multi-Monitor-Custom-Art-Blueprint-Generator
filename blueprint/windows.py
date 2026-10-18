@@ -12,6 +12,7 @@ from fractions import Fraction
 from .core import CaptureError,rect,dimensions
 
 UNIT='windows_virtual_desktop_physical_px'
+BACKENDS={2:'Windows legacy CCD desktop layout + PMv2 User32/DWM read-only worker',18:'Windows CCD + PMv2 User32/DWM read-only worker'}
 OUTPUT_LIMIT=262144
 MAX_PATHS=64
 MAX_MODES=192
@@ -71,7 +72,16 @@ def sequence(value,maximum):
     if not isinstance(value,list) or len(value)>maximum or any(not isinstance(v,dict) for v in value):raise CaptureError('WINDOWS_COUNT_OR_SHAPE_INVALID')
     return value
 
-def parse(raw):
+def query_policy(raw,expected=None):
+    from .windows_native import QUERY_POLICIES
+    if not isinstance(raw,dict):raise CaptureError('WINDOWS_QUERY_POLICY_INVALID')
+    flags=raw.get('query_flags')
+    if type(flags) is not int or flags not in QUERY_POLICIES or raw.get('query_policy')!=QUERY_POLICIES[flags]:
+        raise CaptureError('WINDOWS_QUERY_POLICY_INVALID')
+    if expected is not None and (type(expected) is not int or flags!=expected):raise CaptureError('WINDOWS_QUERY_POLICY_MISMATCH')
+    return {'query_flags':flags,'query_policy':QUERY_POLICIES[flags]}
+
+def parse(raw,expected_query_flags=18):
     if isinstance(raw,str):
         if len(raw.encode('utf-8'))>OUTPUT_LIMIT:raise CaptureError('SOURCE_OUTPUT_LIMIT')
         def unique(pairs):
@@ -88,9 +98,10 @@ def parse(raw):
         code=raw.get('code')
         raise CaptureError(code if code in ERROR_CODES else 'WINDOWS_WORKER_INVALID_RESPONSE')
     if raw.get('status')!='CAPTURED' or raw.get('dpi_context_verified') is not True:raise CaptureError('WINDOWS_DPI_CONTEXT_UNAVAILABLE')
+    policy=query_policy(raw,expected_query_flags);legacy=policy['query_flags']==2
     paths=sequence(raw.get('paths'),MAX_PATHS);modes=sequence(raw.get('modes'),MAX_MODES);monitors=sequence(raw.get('monitors'),MAX_PATHS)
     if not paths or not monitors:raise CaptureError('NO_ACTIVE_DISPLAYS')
-    by_name={};errors=[]
+    by_name={};errors=['WINDOWS_VIRTUAL_MODE_SUPPORT_UNKNOWN'] if legacy else []
     for monitor in monitors:
         key=name(monitor.get('_gdi'))
         if key in by_name:raise CaptureError('WINDOWS_SOURCE_JOIN_UNAVAILABLE')
@@ -110,6 +121,7 @@ def parse(raw):
         if target in targets:raise CaptureError('WINDOWS_DUPLICATE_TARGET')
         targets.add(target)
         si=u32(path.get('source_index'));ti=u32(path.get('target_index'));virtual=bool(flags&8)
+        if legacy and virtual:raise CaptureError('WINDOWS_LEGACY_VIRTUAL_PATH_UNQUALIFIED')
         source_index=(si>>16) if virtual else si;target_index=(ti>>16) if virtual else ti
         invalid=0xffff if virtual else 0xffffffff
         if source_index==invalid:raise CaptureError('WINDOWS_SOURCE_MODE_UNAVAILABLE')
@@ -149,14 +161,14 @@ def parse(raw):
             # its mapping unresolved rather than guessing which role applies.
             errors.append('WINDOWS_DESKTOP_IMAGE_IDENTITY_ROLE_UNQUALIFIED')
         oriented=native[::-1] if native and rotation in (90,270) else native
-        known=rotation is not None and scaling=='identity' and full_image and oriented==r[2:]
+        known=not legacy and rotation is not None and scaling=='identity' and full_image and oriented==r[2:]
         if not known:errors.append('WINDOWS_CROP_MAPPING_UNRESOLVED')
         displays.append({'_connector':str(target),'_crtc':source_key,'primary':primary,'desktop_rect':r,
           'scanout_mode_px':native,'rotation_deg':rotation,'mapping_known':known,'supported_modes':[],
           'refresh_millihz':rate,'reported_panel_mm':None,'transform':None,'reflection':'unknown',
-          '_windows':{'ui_scale_percent':scale,'work_area':work,'rotation_convention':'CCD_CLOCKWISE',
+          '_windows':{**policy,'ui_scale_percent':scale,'work_area':work,'rotation_convention':'CCD_CLOCKWISE',
             'path_scaling':scaling,'target_signal_active_px':native,'desktop_image':image,
-            'virtual_mode_aware_path':virtual,'target_refresh_rational':refresh_raw,'path_refresh_rational':fraction(path.get('path_refresh')),
+            'virtual_mode_aware_path':None if legacy else virtual,'target_refresh_rational':refresh_raw,'path_refresh_rational':fraction(path.get('path_refresh')),
             'scanline_ordering':scanline,'vsync_divider':divider,'dynamic_refresh_flag':bool(flags&16)}})
     if len({s for s,(_,r) in used_sources.items() if r[:2]==[0,0]})!=1:raise CaptureError('WINDOWS_PRIMARY_MISMATCH')
     # Pseudo-monitors cannot silently inflate this physical desktop source inventory.
@@ -164,17 +176,17 @@ def parse(raw):
     windows=raw.get('windows')
     if not isinstance(windows,dict) or windows.get('status')!='CAPTURED_TOPLEVEL_WINDOWS':
         windows={'status':'UNAVAILABLE'};errors.append('WINDOWS_WINDOW_GEOMETRY_UNAVAILABLE')
-    return {'backend':'Windows CCD + PMv2 User32/DWM read-only worker','desktop_unit':UNIT,'displays':displays,
+    return {'backend':BACKENDS[policy['query_flags']],'windows_query':policy,'desktop_unit':UNIT,'displays':displays,
       'windows':windows,'errors':sorted(set(errors)),'inactive_output_count':None}
 
-def coherent_capture(query=bounded_worker,budget=5,attempts=3):
+def coherent_capture(query=bounded_worker,budget=5,attempts=3,expected_query_flags=18):
     deadline=time.monotonic()+budget;stable=None
     for attempt in range(1,attempts+1):
         pair=[]
         for _ in range(2):
             remaining=deadline-time.monotonic()
             if remaining<=0:raise CaptureError('CAPTURE_TIMEOUT')
-            pair.append(parse(query(timeout=min(2,remaining))))
+            pair.append(parse(query(timeout=min(2,remaining)),expected_query_flags=expected_query_flags))
         display_pair=[{**{k:v for k,v in s.items() if k not in ('windows','errors')},
           'errors':[e for e in s['errors'] if e!='WINDOWS_WINDOW_GEOMETRY_UNAVAILABLE']} for s in pair]
         stable=pair[1] if display_pair[0]==display_pair[1] else None
@@ -187,3 +199,11 @@ def coherent_capture(query=bounded_worker,budget=5,attempts=3):
         stable['coherence']={'status':'MATCHING_DISPLAY_PAIR_WINDOW_CAPTURE_UNSTABLE','queries':attempts*2,'limitation':'Window metadata withheld; only the retained display pair matched. No atomic snapshot claim.'}
         return stable
     raise CaptureError('TOPOLOGY_CHANGED_DURING_CAPTURE')
+
+
+def desktop_capture(query=None,budget=5,attempts=3):
+    """Intentional limited backend, never a fallback from an aware failure."""
+    if query is None:
+        def query(**kwargs):
+            return bounded_worker(command=[sys.executable,'-B','-m','blueprint.windows_native','--desktop-layout'],**kwargs)
+    return coherent_capture(query=query,budget=budget,attempts=attempts,expected_query_flags=2)

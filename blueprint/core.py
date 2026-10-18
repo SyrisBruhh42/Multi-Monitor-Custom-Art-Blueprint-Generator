@@ -76,6 +76,11 @@ def normalize(snapshot, timestamp, os_family='Linux', session='x11'):
     unit = snapshot.get('desktop_unit','x11_root_framebuffer_px')
     if unit not in ['x11_root_framebuffer_px','logical_px','logical_points','windows_virtual_desktop_physical_px']:
         raise CaptureError('UNKNOWN_COORDINATE_SPACE')
+    windows_policy=None;legacy_windows=False
+    if unit=='windows_virtual_desktop_physical_px':
+        from .windows import query_policy
+        windows_policy=query_policy(snapshot.get('windows_query'))
+        legacy_windows=windows_policy['query_flags']==2
     displays=[]; crtc_groups={}
     for i,(d,r) in enumerate(zip(ordered,rectangles),1):
         native = d.get('scanout_mode_px')
@@ -92,7 +97,7 @@ def normalize(snapshot, timestamp, os_family='Linux', session='x11'):
             if any(v<=0 for v in physical): physical=None
         oriented_mm=None if physical is None or rotation is None else (physical[::-1] if rotation in [90,270] else physical[:])
         normalized=[r[0]-left,r[1]-top,r[2],r[3]]
-        mapping=bool(d.get('mapping_known')) and oriented is not None
+        mapping=not legacy_windows and bool(d.get('mapping_known')) and oriented is not None
         sx=Fraction(oriented[0],r[2]) if mapping else None
         sy=Fraction(oriented[1],r[3]) if mapping else None
         native_id=f'D{i}'
@@ -125,9 +130,9 @@ def normalize(snapshot, timestamp, os_family='Linux', session='x11'):
         }
         if unit=='windows_virtual_desktop_physical_px':
             from .windows_geometry import display_fields
-            display.update(display_fields(d,[left,top]))
+            display.update(display_fields(d,[left,top],windows_policy))
         displays.append(display)
-        if d.get('_crtc') is not None: crtc_groups.setdefault(d['_crtc'],[]).append(native_id)
+        if not legacy_windows and d.get('_crtc') is not None: crtc_groups.setdefault(d['_crtc'],[]).append(native_id)
     groups=[{'id':f'clone-{i+1}','members':members,'evidence':('Same CCD adapter/source surface; not inferred from overlap.' if unit=='windows_virtual_desktop_physical_px' else 'Same active XRandR CRTC; not inferred from overlap.')} for i,members in enumerate(v for v in crtc_groups.values() if len(v)>1)]
     normalized_rects=[d['normalized_rect']['xywh'] for d in displays]
     mask,holes=partition(normalized_rects,[0,0,width,height])
@@ -144,8 +149,8 @@ def normalize(snapshot, timestamp, os_family='Linux', session='x11'):
         from .window_geometry import normalize_windows
     from .platforms import capabilities
     window_geometry=normalize_windows(snapshot.get('windows'),{'source_origin':[left,top],'unit':unit},displays)
-    return {
-        'schema_version':'1.2.0' if unit=='windows_virtual_desktop_physical_px' else SCHEMA_VERSION,'tool_version':'0.3.0-proposal',
+    result={
+        'schema_version':'1.3.0' if unit=='windows_virtual_desktop_physical_px' else SCHEMA_VERSION,'tool_version':'0.3.0-proposal',
         'platform_capabilities':capabilities(os_family,session),
         'capture':{'utc':timestamp,'os_family':os_family,'session_protocol':session,'backend':snapshot.get('backend','fixture'),
                    'overall_completeness':'PARTIAL','display_geometry':'COMPLETE' if mapping_complete else 'INCOMPLETE',
@@ -164,6 +169,35 @@ def normalize(snapshot, timestamp, os_family='Linux', session='x11'):
           'focus_rule':'Keep critical subjects within an individual display rectangle; seams and unused areas should contain expendable scenery. Window rectangles, when captured, are temporary composition hints; actual visible or privacy-safe pixels remain unknown.'},
         'remaining_gates':['Windows collector IMPLEMENTED_CANDIDATE; native device qualification NOT_RUN','macOS native collector NOT_IMPLEMENTED','Wayland native collector NOT_IMPLEMENTED','Window opacity/occlusion and unmanaged surfaces NOT_QUALIFIED','Signed portable packaging NOT_BUILT','PDF ingestion by target AI NOT_TESTED','Generated media fit/crop/video export NOT_IMPLEMENTED','Actual synchronized wallpaper playback NOT_TESTED']
     }
+    if windows_policy is not None:
+        result['capture']['windows_query']={**windows_policy,'virtual_mode_awareness':'NOT_REQUESTED' if legacy_windows else 'REQUESTED','exact_panel_mapping':'NOT_QUALIFIED' if legacy_windows else 'STRICT_PARSER_RESULT'}
+        result['capture']['desktop_layout']='OBSERVED_COHERENT' if snapshot.get('coherence',{}).get('status') in ('TWO_MATCHING_SNAPSHOTS','MATCHING_DISPLAY_PAIR_WINDOW_CAPTURE_UNSTABLE') else 'FIXTURE_NOT_NATIVE_OBSERVATION'
+        result['capture']['target_mapping']='UNRESOLVED' if not mapping_complete else 'STRICT_DIGITAL_AFFINE'
+    if legacy_windows:
+        result['media_contract']['mask_rule']='active_mask_disjoint_rects are OS-reported desktop source regions; unused_canvas_rects are digital holes. Actual panel visibility, virtual-image mapping and physical gaps are unqualified.'
+        result['media_contract']['fit_rule']='Use the shared desktop canvas for composition only. Exact per-panel output sizes, cuts and transforms are unavailable; do not turn desktop rectangles into validated panel crops.'
+        result['remaining_gates'].insert(0,'Windows exact per-panel output and virtual-image mapping remain UNQUALIFIED; legacy desktop layout is a partial product increment')
+    validate_manifest_backend(result)
+    return result
+
+def validate_manifest_backend(manifest):
+    capture=manifest.get('capture',{});unit=manifest.get('canvas',{}).get('unit')
+    if unit!='windows_virtual_desktop_physical_px' and capture.get('os_family')!='Windows':return
+    from .windows import query_policy,BACKENDS
+    policy=query_policy(capture.get('windows_query'));legacy=policy['query_flags']==2
+    if (unit!='windows_virtual_desktop_physical_px' or capture.get('os_family')!='Windows' or
+        capture.get('session_protocol')!='windows_desktop' or manifest.get('schema_version')!='1.3.0' or
+        capture.get('backend')!=BACKENDS[policy['query_flags']]):raise CaptureError('WINDOWS_SCHEMA_BACKEND_MISMATCH')
+    for display in manifest.get('displays',[]):
+        if query_policy(display.get('windows'))!=policy:raise CaptureError('WINDOWS_QUERY_POLICY_MISMATCH')
+        if legacy and (display['windows'].get('virtual_mode_aware_path') is not None or display['windows'].get('virtual_mode_awareness')!='NOT_REQUESTED'):
+            raise CaptureError('WINDOWS_LEGACY_MAPPING_ASSERTION_INVALID')
+    if legacy and (capture.get('overall_completeness')!='PARTIAL' or capture.get('display_geometry')!='INCOMPLETE' or
+        capture.get('target_mapping')!='UNRESOLVED' or capture['windows_query'].get('virtual_mode_awareness')!='NOT_REQUESTED' or
+        capture['windows_query'].get('exact_panel_mapping')!='NOT_QUALIFIED' or
+        manifest.get('media_contract',{}).get('exact_crops_available') is not False or manifest.get('clone_groups') or
+        any(d.get('mapping_status')!='UNRESOLVED' or any(d.get(k) is not None for k in ('crop_contract','master_to_output_affine_rationals','oriented_to_native_pixel_edge_affine','oriented_output_px','scanout_mode_px')) for d in manifest.get('displays',[]))):
+        raise CaptureError('WINDOWS_LEGACY_MAPPING_ASSERTION_INVALID')
 
 def canonical_json(manifest):
     return json.dumps(manifest,ensure_ascii=True,sort_keys=True,separators=(',',':'),allow_nan=False)
@@ -172,9 +206,13 @@ def prompts(manifest):
     w,h=manifest['canvas']['aspect_ratio']; limit=14
     supported=max(w,h)<=limit*min(w,h)
     still=(f'A tranquil panoramic fantasy landscape at blue hour, one continuous world across the complete canvas, coherent horizon and lighting, spacious detailed atmospheric scenery, critical focal subjects inside a single screen region, no text, no screen borders --ar {w}:{h}') if supported else None
-    return {'provider_policy_date':'2026-10-18','still_status':'READY_TEMPLATE_NOT_GENERATED' if supported else 'UNSUPPORTED_ASPECT_RATIO',
+    result={'provider_policy_date':'2026-10-18','still_status':'READY_TEMPLATE_NOT_GENERATED' if supported else 'UNSUPPORTED_ASPECT_RATIO',
       'midjourney_still':still,'midjourney_motion':'Locked camera; gentle foliage movement and drifting mist; preserve composition and horizon; subtle continuous motion returning smoothly to the starting scene --motion low --loop --raw --bs 1',
       'motion_use':'First generate/select the shared master still, then use it as the starting image in the web animation UI. This motion prompt has no still-only --ar parameter. No upload or provider call occurs here.',
       'general_ai':'Read the complete canonical JSON appendix as the geometry contract. Design one shared master with the stated canvas aspect, honor the active mask and crop rules, and explicitly distinguish observed digital geometry from unknown physical spacing and any missing window bounds. Use captured current window rectangles as optional temporary composition hints, never as guaranteed visibility or privacy masks. Return a tailored still-image prompt and a compatible low-motion animation prompt. Do not claim exact pixel dimensions from prompt text alone.',
       'provider_limits':'Still ratio does not guarantee output pixels; video may adjust ratio. Verify and fit generated media before cropping. The 14:1 non-HD still policy must be refreshed before release; extreme-ratio layouts are rejected, not silently truncated. No model-version flag is hardcoded.',
       'sources':['https://docs.midjourney.com/hc/en-us/articles/31894244298125-Aspect-Ratio','https://docs.midjourney.com/hc/en-us/articles/32199405667853-Version','https://docs.midjourney.com/hc/en-us/articles/37460773864589-Video']}
+
+    if manifest.get('capture',{}).get('windows_query',{}).get('query_flags')==2:
+        result['general_ai']+=' This Windows brief captures desktop source layout only. Virtual-image and physical panel mapping are unknown. Use desktop regions for composition; do not claim validated per-panel cuts, exact output sizes or playback from this brief.'
+    return result
