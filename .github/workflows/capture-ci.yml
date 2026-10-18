@@ -1,0 +1,98 @@
+name: Capture source and native boundaries
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  linux-regression-and-pdf:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r requirements-dev.txt
+      - name: Install PDF text extraction dependency in the ephemeral runner
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends poppler-utils
+      - name: Require Poppler; never silently skip PDF recovery
+        run: command -v pdftotext
+      - run: python -m unittest discover -s tests -v
+  windows-source-and-abi:
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - run: python -m unittest discover -s tests -p test_windows_platform.py -v
+      - run: python -m unittest discover -s tests -p test_windows_native.py -v
+  windows-readonly-native-qualification:
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Require actual desktop capture; unavailable is an unqualified failing gate
+        shell: pwsh
+        run: |
+          $env:PYTHONPATH = $PWD.Path
+          python tests/test_windows_native.py --native-readonly native-qualification.json
+          exit $LASTEXITCODE
+      - name: Compile independent SDK discriminator with the existing hosted compiler
+        if: always()
+        shell: pwsh
+        timeout-minutes: 2
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsRoot = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if ($LASTEXITCODE -ne 0 -or -not $vsRoot) { throw 'Existing hosted C++ compiler unavailable' }
+          $devCmd = Join-Path $vsRoot 'Common7\Tools\VsDevCmd.bat'
+          $compile = '"' + $devCmd + '" -no_logo -arch=x64 && cl /nologo /W4 /WX /EHsc tests\windows_sdk_structure.cpp /Fe:windows_sdk_structure.exe /link user32.lib'
+          & cmd.exe /d /s /c $compile
+          exit $LASTEXITCODE
+      - name: Record bounded independent SDK evidence without changing native acceptance
+        if: always()
+        shell: pwsh
+        timeout-minutes: 1
+        run: |
+          $env:PYTHONPATH = $PWD.Path
+          python tests/test_windows_native.py --sdk-readonly windows-sdk-structure.json windows_sdk_structure.exe
+          exit $LASTEXITCODE
+      - name: Preserve qualification result, including unavailable and failed outcomes
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-readonly-qualification
+          path: |
+            native-qualification.json
+            windows-sdk-structure.json
+          if-no-files-found: error
+  windows-readonly-desktop-layout-partial:
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Require actual coherent desktop and window bounds with no exact panel claims
+        shell: pwsh
+        run: |
+          $env:PYTHONPATH = $PWD.Path
+          python tests/test_windows_native.py --native-desktop-readonly desktop-layout-qualification.json
+          exit $LASTEXITCODE
+      - name: Preserve limited qualification including unavailable and failed outcomes
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-desktop-layout-partial-qualification
+          path: desktop-layout-qualification.json
+          if-no-files-found: error
