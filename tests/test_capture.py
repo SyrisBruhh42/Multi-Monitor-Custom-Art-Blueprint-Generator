@@ -30,6 +30,10 @@ def code(test,expected,call):
     test.assertEqual(caught.exception.code,expected)
 
 class Geometry(unittest.TestCase):
+    def test_schema_carries_window_and_portability_gates(self):
+        m=manifest();self.assertEqual(m['schema_version'],'1.1.0')
+        self.assertEqual(m['window_geometry']['status'],'NOT_COLLECTED')
+        self.assertEqual(m['platform_capabilities']['adapters']['windows']['displays'],'NOT_IMPLEMENTED')
     def test_three_monitor_contract(self):
         m=manifest(); self.assertEqual(m['canvas']['size'],[4080,1920]); self.assertEqual(m['canvas']['aspect_ratio'],[17,8])
         self.assertEqual(m['unused_canvas_rects'],[[1080,0,1920,840]])
