@@ -15,7 +15,11 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -m pip install -r requirements-dev.txt
-      - name: Require existing Poppler; never silently skip PDF recovery
+      - name: Install PDF text extraction dependency in the ephemeral runner
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends poppler-utils
+      - name: Require Poppler; never silently skip PDF recovery
         run: command -v pdftotext
       - run: python -m unittest discover -s tests -v
   windows-source-and-abi:

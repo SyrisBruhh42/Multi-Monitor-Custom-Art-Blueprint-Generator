@@ -4,7 +4,9 @@ Ordinary unittest discovery never mistakes these fixtures for native capture.
 The explicit gate returns nonzero for inaccessible/absent desktop or Windows.
 """
 import ctypes as C
-import hashlib,json,platform,sys,unittest
+import hashlib,io,json,platform,sys,unittest
+from contextlib import redirect_stdout
+from tempfile import TemporaryDirectory
 from datetime import datetime,timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -116,17 +118,94 @@ class WindowsABI(unittest.TestCase):
         for forbidden in ['GetWindowText','GetClassName','GetWindowThreadProcessId','GetDC(','BitBlt','PrintWindow','SetDisplayConfig','ChangeDisplaySettings','SetWindowPos','ShowWindow','CreateWindow','OpenProcess','RegOpenKey','DwmSetWindowAttribute']:
             self.assertNotIn(forbidden,text)
 
+def structural_summary(raw):
+    """CI diagnostic only: bounded flags/indexes/types, never native identities."""
+    from blueprint.windows import OUTPUT_LIMIT,MAX_PATHS,MAX_MODES
+    if not isinstance(raw,str) or len(raw.encode('utf-8',errors='replace'))>OUTPUT_LIMIT:
+        return {'status':'STRUCTURAL_RESPONSE_UNAVAILABLE'}
+    try:value=json.loads(raw)
+    except (ValueError,TypeError):return {'status':'STRUCTURAL_RESPONSE_UNAVAILABLE'}
+    if not isinstance(value,dict) or value.get('status')!='CAPTURED':
+        return {'status':'STRUCTURAL_RESPONSE_UNAVAILABLE'}
+    paths=value.get('paths');modes=value.get('modes')
+    if not isinstance(paths,list) or not isinstance(modes,list):
+        return {'status':'STRUCTURAL_RESPONSE_UNAVAILABLE'}
+    def number(v):return v if type(v) is int and 0<=v<=0xffffffff else None
+    return {'status':'STRUCTURAL_ONLY_NOT_CAPTURE_ACCEPTANCE','query_flags':n.FLAGS,
+      'path_count':len(paths),'mode_count':len(modes),
+      'truncated':len(paths)>MAX_PATHS or len(modes)>MAX_MODES,
+      'paths':[{key:number(item.get(key)) if isinstance(item,dict) else None
+        for key in ('flags','source_index','target_index')} for item in paths[:MAX_PATHS]],
+      'mode_types':[number(item.get('kind')) if isinstance(item,dict) else None for item in modes[:MAX_MODES]]}
+
+class NativeReceiptDiagnostics(unittest.TestCase):
+    def test_structural_summary_excludes_identity_geometry_and_canary_fields(self):
+        from test_windows_platform import fixture
+        raw=fixture();raw['paths'][0].update(source_id=123456789,target_id=234567890,source_adapter=[345678901,0],secret='CANARY_PATH')
+        raw['modes'][0].update(id=456789012,adapter=[567890123,0],secret='CANARY_MODE')
+        result=structural_summary(json.dumps(raw))
+        self.assertEqual(result,{'status':'STRUCTURAL_ONLY_NOT_CAPTURE_ACCEPTANCE','query_flags':18,'path_count':1,'mode_count':2,'truncated':False,'paths':[{'flags':1,'source_index':0,'target_index':1}],'mode_types':[1,2]})
+        for private in ['CANARY','PRIVATE','123456789','234567890','345678901','456789012','567890123','987654321123']:
+            self.assertNotIn(private,json.dumps(result))
+    def test_structural_summary_is_bounded_and_strict_numeric_only(self):
+        raw={'status':'CAPTURED','paths':[{'flags':True,'source_index':'CANARY','target_index':-1}]*65,'modes':[{'kind':2**32}]*193}
+        result=structural_summary(json.dumps(raw))
+        self.assertTrue(result['truncated']);self.assertEqual(len(result['paths']),64);self.assertEqual(len(result['mode_types']),192)
+        self.assertEqual(result['paths'][0],{'flags':None,'source_index':None,'target_index':None});self.assertIsNone(result['mode_types'][0])
+    def test_structural_summary_keeps_virtual_union_words_without_interpretation(self):
+        raw={'status':'CAPTURED','paths':[{'flags':9,'source_index':0xffff,'target_index':(1<<16)|0xffff}],'modes':[{'kind':1},{'kind':2}]}
+        self.assertEqual(structural_summary(json.dumps(raw))['paths'],raw['paths'])
+    def test_structural_summary_rejects_malformed_or_oversized_payload(self):
+        for raw in ['CANARY','[]','{"status":"CAPTURED","paths":null}',json.dumps({'status':'UNAVAILABLE','code':'CANARY'}),'X'*262145,None]:
+            self.assertEqual(structural_summary(raw),{'status':'STRUCTURAL_RESPONSE_UNAVAILABLE'})
+    def probe(self,raw):
+        with TemporaryDirectory() as tmp,patch.object(sys,'platform','win32'),patch('blueprint.windows.bounded_worker',return_value=json.dumps(raw)),redirect_stdout(io.StringIO()):
+            destination=Path(tmp)/'receipt.json';exit_code=native_probe(destination)
+            return exit_code,json.loads(destination.read_text())
+    def test_invalid_mode_index_remains_failure_with_structural_diagnostic(self):
+        from test_windows_platform import fixture
+        raw=fixture();raw['paths'][0]['target_index']=999
+        exit_code,result=self.probe(raw)
+        self.assertEqual(exit_code,2);self.assertEqual(result['code'],'WINDOWS_MODE_INDEX_INVALID')
+        self.assertEqual(result['native_capture'],'UNQUALIFIED_UNAVAILABLE')
+        self.assertEqual(result['structural_diagnostics']['queries_with_response'],1)
+        self.assertEqual(result['structural_diagnostics']['last_responses'][0]['paths'][0]['target_index'],999)
+        self.assertNotIn('PRIVATE',json.dumps(result));self.assertNotIn('987654321123',json.dumps(result))
+    def test_only_last_two_bounded_responses_are_retained(self):
+        from test_windows_platform import fixture,second
+        values=[json.dumps(fixture()),json.dumps(second(fixture()))]*3
+        with TemporaryDirectory() as tmp,patch.object(sys,'platform','win32'),patch('blueprint.windows.bounded_worker',side_effect=values),redirect_stdout(io.StringIO()):
+            destination=Path(tmp)/'receipt.json';self.assertEqual(native_probe(destination),2)
+            result=json.loads(destination.read_text())
+        self.assertEqual(result['code'],'TOPOLOGY_CHANGED_DURING_CAPTURE')
+        self.assertEqual(result['structural_diagnostics']['queries_with_response'],6)
+        self.assertEqual(len(result['structural_diagnostics']['last_responses']),2)
+        self.assertEqual([r['path_count'] for r in result['structural_diagnostics']['last_responses']],[1,2])
+    def test_diagnostics_preserve_existing_success_and_virtual_hold_gates(self):
+        from test_windows_platform import fixture
+        exit_code,result=self.probe(fixture())
+        self.assertEqual(exit_code,0);self.assertEqual(result['native_capture'],'PASS_BOUNDED_RUNNER_READONLY')
+        raw=fixture();raw['paths'][0].update(flags=9,source_index=0xffff,target_index=0x1ffff)
+        exit_code,result=self.probe(raw)
+        self.assertEqual(exit_code,2);self.assertEqual(result['native_capture'],'UNQUALIFIED_INCOMPLETE_OBSERVATION')
+        self.assertEqual(result['structural_diagnostics']['queries_with_response'],2)
+
 def native_probe(destination):
     """CI-only invocation: actual read-only data or nonzero unqualified result."""
-    from blueprint.windows import coherent_capture
+    from blueprint.windows import coherent_capture,bounded_worker
     result={'kind':'NATIVE_WINDOWS_READONLY_QUALIFICATION','os':platform.system(),'os_release':platform.release(),
       'architecture':platform.machine(),'python':platform.python_version(),'native_capture':'NOT_RUN',
       'device_matrix':'NOT_RUN','portable_distribution':'NOT_BUILT'}
-    exit_code=2
+    exit_code=2;responses=[];query_count=0
+    def observed_query(**kwargs):
+        nonlocal query_count
+        raw=bounded_worker(**kwargs);query_count+=1
+        responses.append(structural_summary(raw));del responses[:-2]
+        return raw
     try:
         if sys.platform!='win32':raise CaptureError('WINDOWS_NATIVE_PLATFORM_REQUIRED')
         n.validate_abi();result['abi']='PASS_NATIVE_WINDOWS_STRUCT_LAYOUT'
-        snapshot=coherent_capture()
+        snapshot=coherent_capture(query=observed_query)
         manifest=normalize(snapshot,datetime.now(timezone.utc).isoformat(),os_family='Windows',session='windows_desktop')
         result['display_count']=len(manifest['displays']);result['display_geometry']=manifest['capture']['display_geometry']
         result['windows']=manifest['window_geometry']['status'];result['window_count']=len(manifest['window_geometry']['items'] or [])
@@ -138,6 +217,7 @@ def native_probe(destination):
         else:result['native_capture']='UNQUALIFIED_INCOMPLETE_OBSERVATION'
     except CaptureError as error:result.update(native_capture='UNQUALIFIED_UNAVAILABLE',code=error.code)
     except Exception:result.update(native_capture='FAILED',code='NATIVE_PROBE_UNEXPECTED_FAILURE')
+    result['structural_diagnostics']={'queries_with_response':query_count,'last_responses':responses}
     Path(destination).write_text(json.dumps(result,indent=2)+'\n',encoding='utf-8')
     print(json.dumps(result,separators=(',',':')))
     return exit_code
