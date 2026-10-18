@@ -53,7 +53,7 @@ def write_pdf(path,manifest):
             c.setFillColor(colors.HexColor('#43566B')); c.setFont('BriefSans',8); c.drawCentredString(245,3,'Synthetic diagram. Gray areas are unused digital canvas, not measured desk gaps.')
     add('Your display-aware art brief','Title')
     add('OFFLINE CAPTURE PROPOSAL  |  Searchable, self-contained AI handoff','SmallBrief')
-    add(f'Capture: {manifest["capture"]["utc"]}. Overall result: PARTIAL. Digital geometry: {manifest["capture"]["display_geometry"]}. Window geometry has not yet been collected.')
+    add(f'Capture: {manifest["capture"]["utc"]}. Overall result: PARTIAL. Digital geometry: {manifest["capture"]["display_geometry"]}. Window geometry: {manifest["window_geometry"]["status"]}.')
     w,h=manifest['canvas']['size']; a,b=manifest['canvas']['aspect_ratio']
     add(f'{len(manifest["displays"])} displays - {w} x {h} shared canvas','Heading1')
     add(f'Shared master aspect ratio: {a}:{b}. Diagram preserves desktop proportions.','SmallBrief')
@@ -65,6 +65,23 @@ def write_pdf(path,manifest):
     table(rows,[76,100,100,70,144]); story.append(Spacer(1,10))
     add('What is known','Heading2'); add('Desktop rectangles, current scanout modes and orientation come from the operating system. Portrait physical axes are rotated once. Physical sizes are reported values, not ruler measurements. Logical UI scale, backing pixels, bezel width, desk gaps, monitor angles and the viewer position remain distinct or unknown.')
     add('What this file contains','Heading2'); add('Exact digital mapping and mask rules, still and motion prompts, source limitations, and every canonical JSON character in a searchable text appendix. No screenshot, window title, display serial, raw EDID or private file path is included.')
+    story.append(PageBreak())
+    add('Windows and desktop work area','Heading1')
+    windows=manifest['window_geometry']
+    add(f'Window capture: {windows["status"]}. {windows["scope"]}')
+    add('Only anonymous numeric rectangles and states are included. Window titles, application names, content and pixels were not collected. Current bounds can guide composition, but do not establish opacity, actual wallpaper visibility or a privacy mask.')
+    if windows.get('items') is not None:
+        add(f'{len(windows["items"])} managed windows. Order runs from bottom to top; W identifiers are local to this capture.','SmallBrief')
+        rows=[['Window','Client x, y, width, height','Frame bounds','State / desktop']]
+        for item in windows['items']:
+            rows.append([item['id'],', '.join(map(str,item['client_rect'])),', '.join(map(str,item['frame_rect'])) if item['frame_rect'] else 'Unknown; client only',item['map_state']+' / '+('current' if item['on_current_desktop'] is True else 'other' if item['on_current_desktop'] is False else 'unknown')])
+        table(rows,[48,157,157,128])
+        work=windows['work_area']
+        add(f'Current desktop work area: {work["reported_xywh"] if work["reported_xywh"] else "unknown"}. Mapping: {work["status"]}. {work["reason"]}','SmallBrief')
+    for limitation in windows['limitations']:add('- '+limitation,'SmallBrief')
+    add('Platform readiness','Heading2')
+    table([['Platform','Displays','Windows']]+[[key,value['displays'],value['windows']] for key,value in manifest['platform_capabilities']['adapters'].items()],[110,140,240])
+    add(manifest['platform_capabilities']['portable_distribution'],'SmallBrief')
     story.append(PageBreak())
     add('Geometry and output contract','Title')
     add(manifest['canvas']['coordinate_rule']); add('Source desktop origin: '+str(manifest['canvas']['source_origin'])+'. Normalize by subtracting this one shared origin from every display. Units: '+manifest['canvas']['unit']+'.')
@@ -88,6 +105,8 @@ def write_pdf(path,manifest):
     for item in manifest['remaining_gates']: add('- '+item,'SmallBrief')
     add('Sources checked 2026-10-18','Heading2')
     for url in prompt['sources']: add(url,'SmallBrief')
+    add('EWMH: https://specifications.freedesktop.org/wm/latest-single/','SmallBrief')
+    add('Xlib: https://xorg.freedesktop.org/archive/current/doc/libX11/libX11/libX11.html','SmallBrief')
     add('XRandR protocol: https://xorg.freedesktop.org/archive/current/doc/randrproto/randrproto.txt','SmallBrief')
     story.append(PageBreak())
     add('Complete canonical JSON','Title')

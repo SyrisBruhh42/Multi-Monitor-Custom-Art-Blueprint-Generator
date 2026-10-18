@@ -7,6 +7,15 @@ from blueprint.export import write_bundle
 from test_capture import manifest
 
 class ExportFailures(unittest.TestCase):
+    def test_window_manifest_survives_bundle_without_private_source_fields(self):
+        from test_windows import manifest as window_manifest
+        with TemporaryDirectory() as tmp:
+            with patch('blueprint.export.write_pdf',side_effect=lambda path,_:path.write_bytes(b'synthetic-placeholder')):
+                folder=write_bundle(tmp,window_manifest())
+            data=json.loads((folder/'layout.json').read_text())
+            self.assertEqual(data['window_geometry']['status'],'CAPTURED_MANAGED_WINDOWS')
+            self.assertNotIn('PRIVATE_TITLE_CANARY',(folder/'layout.json').read_text())
+            self.assertIn('temporary composition hints',data['prompts']['general_ai'])
     def test_failed_pdf_retains_partial_and_previous_export(self):
         with TemporaryDirectory() as tmp:
             parent=Path(tmp); previous=parent/'capture-existing'; previous.mkdir(); (previous/'AI-brief.pdf').write_bytes(b'preserve')

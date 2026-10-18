@@ -3,7 +3,7 @@ from fractions import Fraction
 from math import gcd
 import json
 
-SCHEMA_VERSION = '1.0.0'
+SCHEMA_VERSION = '1.1.0'
 MAX_DISPLAYS = 64
 LIMIT = 10_000_000
 
@@ -135,8 +135,12 @@ def normalize(snapshot, timestamp, os_family='Linux', session='x11'):
             if right>x and bottom>y: overlaps.append({'displays':[displays[i]['id'],displays[j]['id']],'xywh':[x,y,right-x,bottom-y],'relation':'confirmed_clone' if any(displays[i]['id'] in g['members'] and displays[j]['id'] in g['members'] for g in groups) else 'overlap_only_mirroring_unknown'})
     g=gcd(width,height)
     mapping_complete=all(d['mapping_status']=='EXACT_DIGITAL_AFFINE' for d in displays)
+    from .window_geometry import normalize_windows
+    from .platforms import capabilities
+    window_geometry=normalize_windows(snapshot.get('windows'),{'source_origin':[left,top],'unit':unit},displays)
     return {
-        'schema_version':SCHEMA_VERSION,'tool_version':'0.1.0-proposal',
+        'schema_version':SCHEMA_VERSION,'tool_version':'0.2.0-proposal',
+        'platform_capabilities':capabilities(os_family,session),
         'capture':{'utc':timestamp,'os_family':os_family,'session_protocol':session,'backend':snapshot.get('backend','fixture'),
                    'overall_completeness':'PARTIAL','display_geometry':'COMPLETE' if mapping_complete else 'INCOMPLETE',
                    'snapshot_coherence':snapshot.get('coherence',{'status':'FIXTURE'}),'source_errors':snapshot.get('errors',[]),
@@ -146,13 +150,13 @@ def normalize(snapshot, timestamp, os_family='Linux', session='x11'):
                   'physical_continuity':'UNVERIFIED; digital desktop placement does not measure desk gaps or bezels.'},
         'displays':displays,'active_mask_disjoint_rects':mask,'unused_canvas_rects':holes,
         'clone_groups':groups,'overlaps':overlaps,'inactive_output_count':snapshot.get('inactive_output_count',0),
-        'window_geometry':{'status':'NOT_IMPLEMENTED','items':None,'reason':'Title-free per-window bounds, work areas, occlusion and privacy behavior remain required product work.'},
+        'window_geometry':window_geometry,
         'media_contract':{'exact_crops_available':mapping_complete,'master_size': [width,height],
           'fit_rule':'Inspect actual generated dimensions. Fit one shared master to the canvas before any per-display crop; never fit displays independently. Any crop, padding or upscale must be declared.',
           'mask_rule':'Only active_mask_disjoint_rects are visible. unused_canvas_rects are digital holes, not measured physical gaps. Duplicate clone crops must not enlarge the canvas.',
           'motion_rule':'Use one shared frame timeline, duration and fps for every output. Locked camera and low motion are defaults; codec, decode headroom, playback sync and seamless looping are NOT_TESTED.',
-          'focus_rule':'Keep critical subjects within an individual display rectangle; seams and unused areas should contain expendable scenery. No application/window-safe region is known.'},
-        'remaining_gates':['Windows native collector NOT_IMPLEMENTED','macOS native collector NOT_IMPLEMENTED','Wayland native collector NOT_IMPLEMENTED','Window geometry NOT_IMPLEMENTED','Signed portable packaging NOT_BUILT','PDF ingestion by target AI NOT_TESTED','Generated media fit/crop/video export NOT_IMPLEMENTED','Actual synchronized wallpaper playback NOT_TESTED']
+          'focus_rule':'Keep critical subjects within an individual display rectangle; seams and unused areas should contain expendable scenery. Window rectangles, when captured, are temporary composition hints; actual visible or privacy-safe pixels remain unknown.'},
+        'remaining_gates':['Windows native collector NOT_IMPLEMENTED','macOS native collector NOT_IMPLEMENTED','Wayland native collector NOT_IMPLEMENTED','Window opacity/occlusion and unmanaged surfaces NOT_QUALIFIED','Signed portable packaging NOT_BUILT','PDF ingestion by target AI NOT_TESTED','Generated media fit/crop/video export NOT_IMPLEMENTED','Actual synchronized wallpaper playback NOT_TESTED']
     }
 
 def canonical_json(manifest):
@@ -165,6 +169,6 @@ def prompts(manifest):
     return {'provider_policy_date':'2026-10-18','still_status':'READY_TEMPLATE_NOT_GENERATED' if supported else 'UNSUPPORTED_ASPECT_RATIO',
       'midjourney_still':still,'midjourney_motion':'Locked camera; gentle foliage movement and drifting mist; preserve composition and horizon; subtle continuous motion returning smoothly to the starting scene --motion low --loop --raw --bs 1',
       'motion_use':'First generate/select the shared master still, then use it as the starting image in the web animation UI. This motion prompt has no still-only --ar parameter. No upload or provider call occurs here.',
-      'general_ai':'Read the complete canonical JSON appendix as the geometry contract. Design one shared master with the stated canvas aspect, honor the active mask and crop rules, and explicitly distinguish observed digital geometry from unknown physical spacing and missing window bounds. Return a tailored still-image prompt and a compatible low-motion animation prompt. Do not claim exact pixel dimensions from prompt text alone.',
+      'general_ai':'Read the complete canonical JSON appendix as the geometry contract. Design one shared master with the stated canvas aspect, honor the active mask and crop rules, and explicitly distinguish observed digital geometry from unknown physical spacing and any missing window bounds. Use captured current window rectangles as optional temporary composition hints, never as guaranteed visibility or privacy masks. Return a tailored still-image prompt and a compatible low-motion animation prompt. Do not claim exact pixel dimensions from prompt text alone.',
       'provider_limits':'Still ratio does not guarantee output pixels; video may adjust ratio. Verify and fit generated media before cropping. The 14:1 non-HD still policy must be refreshed before release; extreme-ratio layouts are rejected, not silently truncated. No model-version flag is hardcoded.',
       'sources':['https://docs.midjourney.com/hc/en-us/articles/31894244298125-Aspect-Ratio','https://docs.midjourney.com/hc/en-us/articles/32199405667853-Version','https://docs.midjourney.com/hc/en-us/articles/37460773864589-Video']}
