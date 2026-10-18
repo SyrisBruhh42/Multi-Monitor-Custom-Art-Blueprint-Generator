@@ -196,23 +196,33 @@ def comparative_child():
     except Exception:result={'status':'DIAGNOSTIC_UNAVAILABLE','code':'WINDOWS_DISPLAY_QUERY_FAILED'}
     print(json.dumps(result,separators=(',',':'),allow_nan=False))
 
-def read_comparison(query):
+def read_comparison(query, *, command=None, sdk=False):
     # Same bounded child runner as production, but a separate diagnostic-only
     # entry point. Reject unexpected fields/shapes; no diagnostic can alter the
     # main capture result or satisfy the native gate.
     try:
-        raw=query(timeout=2,limit=65536,command=[sys.executable,'-B',str(Path(__file__).resolve()),'--structural-compare'])
+        raw=query(timeout=2,limit=65536,command=command or [sys.executable,'-B',str(Path(__file__).resolve()),'--structural-compare'])
         value=json.loads(raw)
         if not isinstance(value,dict):raise ValueError()
         if value.get('status')=='DIAGNOSTIC_UNAVAILABLE':
             if set(value)!={'status','code'} or value['code'] not in n.ERROR_CODES:raise ValueError()
             return value
-        if set(value)!={'status','comparison','queries','ctypes_offsets','byteorder'}:raise ValueError()
+        offset_key='sdk_offsets' if sdk else 'ctypes_offsets'
+        keys={'status','comparison','queries',offset_key,'byteorder'}|({'sdk_sizes'} if sdk else set())
+        if set(value)!=keys:raise ValueError()
         if value['status']!='DIAGNOSTIC_ONLY_NOT_CAPTURE_ACCEPTANCE' or value['comparison']!='SEPARATE_NONATOMIC_READS':raise ValueError()
         if value['byteorder'] not in ('little','big'):raise ValueError()
         expected={key:{field:getattr(cls,field).offset for field,_ in cls._fields_}
           for key,cls in [('PathSource',n.PathSource),('PathTarget',n.PathTarget),('DisplayPath',n.DisplayPath),('Mode',n.Mode)]}
-        if value['ctypes_offsets']!=expected:raise ValueError()
+        if sdk:
+            observed=value[offset_key]
+            if not isinstance(observed,dict) or set(observed)!=set(expected):raise ValueError()
+            for key,fields in expected.items():
+                if not isinstance(observed[key],dict) or set(observed[key])!=set(fields):raise ValueError()
+                if any(type(v) is not int or not 0<=v<=1024 for v in observed[key].values()):raise ValueError()
+            if not isinstance(value['sdk_sizes'],dict) or set(value['sdk_sizes'])!=set(expected):raise ValueError()
+            if any(type(v) is not int or not 0<v<=1024 for v in value['sdk_sizes'].values()):raise ValueError()
+        elif value[offset_key]!=expected:raise ValueError()
         if not isinstance(value['queries'],list) or len(value['queries'])!=2:raise ValueError()
         for flags,item in zip((18,2),value['queries']):
             if not isinstance(item,dict) or type(item.get('query_flags')) is not int or item['query_flags']!=flags:raise ValueError()
@@ -226,7 +236,7 @@ def read_comparison(query):
             def number(v):return v is None or type(v) is int and 0<=v<=0xffffffff
             if not all(number(kind) for kind in item['mode_types']):raise ValueError()
             for path in item['paths']:
-                numeric={'flags','source_index','target_index'}
+                numeric={'flags','source_index','target_index'}|({'source_bitfield_index','clone_group_index','target_bitfield_index','desktop_bitfield_index'} if sdk else set())
                 boolean={role+'_'+word+'_word_matches_endpoint' for role in ('source','target') for word in ('full','high')}
                 if not isinstance(path,dict) or set(path)!=numeric|boolean:raise ValueError()
                 if not all(number(path[k]) for k in numeric) or not all(type(path[k]) is bool for k in boolean):raise ValueError()
@@ -234,6 +244,25 @@ def read_comparison(query):
     except CaptureError as error:
         return {'status':'DIAGNOSTIC_UNAVAILABLE','code':error.code if error.code in ('CAPTURE_TIMEOUT','SOURCE_OUTPUT_LIMIT') else 'WINDOWS_DISPLAY_QUERY_FAILED'}
     except Exception:return {'status':'DIAGNOSTIC_UNAVAILABLE','code':'STRUCTURAL_RESPONSE_UNAVAILABLE'}
+
+def sdk_probe(destination,executable):
+    from blueprint.windows import bounded_worker
+    result={'kind':'WINDOWS_SDK_READONLY_DISCRIMINATOR','native_capture':'NOT_QUALIFIED_BY_DIAGNOSTIC',
+      'source_sha256':hashlib.sha256(Path(__file__).with_name('windows_sdk_structure.cpp').read_bytes()).hexdigest()}
+    if sys.platform!='win32':
+        value={'status':'DIAGNOSTIC_UNAVAILABLE','code':'WINDOWS_NATIVE_PLATFORM_REQUIRED'}
+    else:
+        value=read_comparison(bounded_worker,command=[str(Path(executable).resolve())],sdk=True)
+    result['observation']=value
+    if value.get('status')=='DIAGNOSTIC_ONLY_NOT_CAPTURE_ACCEPTANCE':
+        expected={key:{field:getattr(cls,field).offset for field,_ in cls._fields_}
+          for key,cls in [('PathSource',n.PathSource),('PathTarget',n.PathTarget),('DisplayPath',n.DisplayPath),('Mode',n.Mode)]}
+        result['sdk_matches_ctypes']=value['sdk_offsets']==expected and value['sdk_sizes']=={key:C.sizeof(getattr(n,key)) for key in expected}
+        code=0  # Diagnostic recorded, never native-capture acceptance.
+    else:code=2
+    Path(destination).write_text(json.dumps(result,indent=2)+'\n',encoding='utf-8')
+    print(json.dumps(result,separators=(',',':')))
+    return code
 
 class NativeReceiptDiagnostics(unittest.TestCase):
     def test_structural_summary_excludes_identity_geometry_and_canary_fields(self):
@@ -377,6 +406,59 @@ class WindowsComparisonDiagnostics(unittest.TestCase):
         self.assertEqual(result['query_comparison_diagnostic'],comparison);self.assertEqual(len(calls),2)
         self.assertNotIn('PRIVATE',json.dumps(result))
 
+class WindowsSDKDiscriminator(unittest.TestCase):
+    def sample(self):
+        original=WindowsComparisonDiagnostics().api()
+        value=comparative_structure(original)
+        value['sdk_offsets']=value.pop('ctypes_offsets')
+        value['sdk_sizes']={key:C.sizeof(getattr(n,key)) for key in value['sdk_offsets']}
+        for query in value['queries']:
+            for path in query['paths']:
+                path.update(source_bitfield_index=path['source_index']>>16,clone_group_index=path['source_index']&0xffff,
+                  target_bitfield_index=path['target_index']>>16,desktop_bitfield_index=path['target_index']&0xffff)
+        return value
+    def test_sdk_protocol_retains_separate_offsets_and_union_fields(self):
+        value=self.sample();calls=[]
+        def query(**kwargs):calls.append(kwargs);return json.dumps(value)
+        self.assertEqual(read_comparison(query,command=['owned-sdk.exe'],sdk=True),value)
+        self.assertEqual(calls,[{'timeout':2,'limit':65536,'command':['owned-sdk.exe']}])
+        self.assertEqual(value['queries'][0]['paths'][0]['source_bitfield_index'],1)
+        self.assertEqual(value['queries'][0]['paths'][0]['clone_group_index'],65535)
+    def test_sdk_offset_disagreement_is_preserved_for_diagnosis(self):
+        value=self.sample();value['sdk_offsets']['DisplayPath']['flags']=64
+        self.assertEqual(read_comparison(lambda **_:json.dumps(value),sdk=True),value)
+    def test_sdk_extra_identity_and_invalid_numeric_fields_refuse(self):
+        for part in ('private','boolean','offset','oversize'):
+            value=self.sample()
+            if part=='private':value['queries'][0]['paths'][0]['adapter']='PRIVATE'
+            elif part=='boolean':value['queries'][0]['paths'][0]['source_bitfield_index']=True
+            elif part=='offset':value['sdk_offsets']['Mode']['value']='PRIVATE'
+            else:value['sdk_sizes']['Mode']=2**32
+            result=read_comparison(lambda **_:json.dumps(value),sdk=True)
+            self.assertEqual(result,{'status':'DIAGNOSTIC_UNAVAILABLE','code':'STRUCTURAL_RESPONSE_UNAVAILABLE'})
+            self.assertNotIn('PRIVATE',json.dumps(result))
+    def test_sdk_receipt_never_claims_native_capture(self):
+        for matches in (True,False):
+            value=self.sample()
+            if not matches:value['sdk_offsets']['Mode']['value']=24
+            with TemporaryDirectory() as tmp,patch.object(sys,'platform','win32'),patch('blueprint.windows.bounded_worker',return_value=json.dumps(value)),redirect_stdout(io.StringIO()):
+                destination=Path(tmp)/'sdk.json';self.assertEqual(sdk_probe(destination,Path(tmp)/'owned-sdk.exe'),0)
+                result=json.loads(destination.read_text())
+            self.assertEqual(result['native_capture'],'NOT_QUALIFIED_BY_DIAGNOSTIC')
+            self.assertEqual(result['sdk_matches_ctypes'],matches)
+            self.assertEqual(result['source_sha256'],hashlib.sha256(Path(__file__).with_name('windows_sdk_structure.cpp').read_bytes()).hexdigest())
+    def test_sdk_receipt_on_linux_does_not_start_a_native_child(self):
+        with TemporaryDirectory() as tmp,patch.object(sys,'platform','linux'),patch('blueprint.windows.bounded_worker',side_effect=AssertionError('Must not start')),redirect_stdout(io.StringIO()):
+            destination=Path(tmp)/'sdk.json';self.assertEqual(sdk_probe(destination,'unstarted.exe'),2)
+            value=json.loads(destination.read_text())
+        self.assertEqual(value['observation'],{'status':'DIAGNOSTIC_UNAVAILABLE','code':'WINDOWS_NATIVE_PLATFORM_REQUIRED'})
+    def test_sdk_missing_executable_is_explicit_diagnostic_failure(self):
+        with TemporaryDirectory() as tmp,patch.object(sys,'platform','win32'),patch('blueprint.windows.bounded_worker',side_effect=CaptureError('WINDOWS_WORKER_UNAVAILABLE')),redirect_stdout(io.StringIO()):
+            destination=Path(tmp)/'sdk.json';self.assertEqual(sdk_probe(destination,'absent.exe'),2)
+            value=json.loads(destination.read_text())
+        self.assertEqual(value['observation']['status'],'DIAGNOSTIC_UNAVAILABLE')
+        self.assertEqual(value['native_capture'],'NOT_QUALIFIED_BY_DIAGNOSTIC')
+
 def native_probe(destination):
     """CI-only invocation: actual read-only data or nonzero unqualified result."""
     from blueprint.windows import coherent_capture,bounded_worker
@@ -412,6 +494,7 @@ def native_probe(destination):
     return exit_code
 
 if __name__=='__main__':
+    if len(sys.argv)==4 and sys.argv[1]=='--sdk-readonly':sys.exit(sdk_probe(sys.argv[2],sys.argv[3]))
     if len(sys.argv)==2 and sys.argv[1]=='--structural-compare':comparative_child();sys.exit(0)
     if len(sys.argv)==3 and sys.argv[1]=='--native-readonly':sys.exit(native_probe(sys.argv[2]))
     unittest.main(verbosity=2)

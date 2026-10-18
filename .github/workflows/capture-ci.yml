@@ -46,10 +46,32 @@ jobs:
           $env:PYTHONPATH = $PWD.Path
           python tests/test_windows_native.py --native-readonly native-qualification.json
           exit $LASTEXITCODE
+      - name: Compile independent SDK discriminator with the existing hosted compiler
+        if: always()
+        shell: pwsh
+        timeout-minutes: 2
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsRoot = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if ($LASTEXITCODE -ne 0 -or -not $vsRoot) { throw 'Existing hosted C++ compiler unavailable' }
+          $devCmd = Join-Path $vsRoot 'Common7\Tools\VsDevCmd.bat'
+          $compile = '"' + $devCmd + '" -no_logo -arch=x64 && cl /nologo /W4 /WX /EHsc tests\windows_sdk_structure.cpp /Fe:windows_sdk_structure.exe /link user32.lib'
+          & cmd.exe /d /s /c $compile
+          exit $LASTEXITCODE
+      - name: Record bounded independent SDK evidence without changing native acceptance
+        if: always()
+        shell: pwsh
+        timeout-minutes: 1
+        run: |
+          $env:PYTHONPATH = $PWD.Path
+          python tests/test_windows_native.py --sdk-readonly windows-sdk-structure.json windows_sdk_structure.exe
+          exit $LASTEXITCODE
       - name: Preserve qualification result, including unavailable and failed outcomes
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: windows-readonly-qualification
-          path: native-qualification.json
+          path: |
+            native-qualification.json
+            windows-sdk-structure.json
           if-no-files-found: error
