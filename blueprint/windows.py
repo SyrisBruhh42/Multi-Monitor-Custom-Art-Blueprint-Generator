@@ -95,10 +95,11 @@ def parse(raw):
         key=name(monitor.get('_gdi'))
         if key in by_name:raise CaptureError('WINDOWS_SOURCE_JOIN_UNAVAILABLE')
         by_name[key]=monitor
-    def mode(index,kind,expected_adapter,expected_id=None):
+    def mode(index,kind,expected_identities):
         if index>=len(modes):raise CaptureError('WINDOWS_MODE_INDEX_INVALID')
         value=modes[index]
-        if u32(value.get('kind'))!=kind or adapter(value.get('adapter'))!=expected_adapter or (expected_id is not None and u32(value.get('id'))!=expected_id):raise CaptureError('WINDOWS_MODE_IDENTITY_MISMATCH')
+        identity=(adapter(value.get('adapter')),u32(value.get('id')))
+        if u32(value.get('kind'))!=kind or identity not in expected_identities:raise CaptureError('WINDOWS_MODE_IDENTITY_MISMATCH')
         return value
     displays=[];targets=set();used_sources={}
     for path in paths:
@@ -112,7 +113,7 @@ def parse(raw):
         source_index=(si>>16) if virtual else si;target_index=(ti>>16) if virtual else ti
         invalid=0xffff if virtual else 0xffffffff
         if source_index==invalid:raise CaptureError('WINDOWS_SOURCE_MODE_UNAVAILABLE')
-        source=mode(source_index,1,sa,sid);r=rect(source.get('rect'))
+        source=mode(source_index,1,{(sa,sid)});r=rect(source.get('rect'))
         gdi=name(path.get('_gdi'));monitor=by_name.get(gdi)
         if monitor is None or rect(monitor.get('rect'))!=r:raise CaptureError('WINDOWS_SOURCE_JOIN_UNAVAILABLE')
         source_key=(*sa,sid)
@@ -126,7 +127,7 @@ def parse(raw):
         if scale is not None and (type(scale) is not int or scale not in SCALES):
             scale=None
         if scale is None:errors.append('WINDOWS_UI_SCALE_UNAVAILABLE')
-        target_mode=None if target_index==invalid else mode(target_index,2,ta,tid)
+        target_mode=None if target_index==invalid else mode(target_index,2,{(ta,tid)})
         native=dimensions(target_mode.get('active_size')) if target_mode else None
         if native is None:errors.append('WINDOWS_TARGET_MODE_UNAVAILABLE')
         rotation={1:0,2:90,3:180,4:270}.get(u32(path.get('rotation')))
@@ -139,11 +140,14 @@ def parse(raw):
         # The first slice intentionally does not solve positioned/clipped virtual images.
         image=None;full_image=not virtual
         if virtual and (ti&0xffff)!=0xffff:
-            item=mode(ti&0xffff,3,ta)
+            item=mode(ti&0xffff,3,{(sa,sid),(ta,tid)})
             size=dimensions(item.get('path_size'));region=rect(item.get('region'));clip=rect(item.get('clip'))
             if region[0]<0 or region[1]<0 or region[0]+region[2]>size[0] or region[1]+region[3]>size[1]:raise CaptureError('WINDOWS_DESKTOP_IMAGE_INVALID')
             image={'path_size':size,'region':region,'clip':clip}
-            full_image=size==r[2:] and region==[0,0,*r[2:]] and clip==[0,0,*r[2:]]
+            # MODE_INFO documents source-or-target identity but does not assign
+            # the DESKTOP_IMAGE role. Validate a related endpoint, then keep
+            # its mapping unresolved rather than guessing which role applies.
+            errors.append('WINDOWS_DESKTOP_IMAGE_IDENTITY_ROLE_UNQUALIFIED')
         oriented=native[::-1] if native and rotation in (90,270) else native
         known=rotation is not None and scaling=='identity' and full_image and oriented==r[2:]
         if not known:errors.append('WINDOWS_CROP_MAPPING_UNRESOLVED')

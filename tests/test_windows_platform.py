@@ -58,12 +58,40 @@ class WindowsGeometry(unittest.TestCase):
         self.assertIn('CCD',m['clone_groups'][0]['evidence'])
         raw=second(fixture(),x=0,y=1,rotation=1);m=manifest(raw)
         self.assertFalse(m['clone_groups']);self.assertEqual(m['overlaps'][0]['relation'],'overlap_only_mirroring_unknown')
-    def test_virtual_indexes_and_full_image(self):
+    def test_virtual_indexes_and_full_image_remain_role_unqualified(self):
         raw=fixture();raw['paths'][0].update(flags=9,source_index=0xffff,target_index=(1<<16)|2)
         raw['modes'].append({'kind':3,'id':1,'adapter':[7,0],'path_size':[1920,1080],'region':[0,0,1920,1080],'clip':[0,0,1920,1080]})
-        self.assertTrue(manifest(raw)['media_contract']['exact_crops_available'])
+        self.assertFalse(manifest(raw)['media_contract']['exact_crops_available'])
         raw['modes'][2]['clip']=[0,0,1800,1080]
         self.assertFalse(manifest(raw)['media_contract']['exact_crops_available'])
+    def test_desktop_image_malformed_id_refuses(self):
+        for identity in (None,True,False,'private-invalid-identity',-1,2**32):
+            with self.subTest(identity=identity):
+                raw=fixture();raw['paths'][0].update(flags=9,source_index=0xffff,target_index=(1<<16)|2)
+                raw['modes'].append({'kind':3,'id':identity,'adapter':[7,0],'path_size':[1920,1080],'region':[0,0,1920,1080],'clip':[0,0,1920,1080]})
+                code(self,'WINDOWS_MALFORMED_OBSERVATION',lambda:manifest(raw))
+    def test_desktop_image_foreign_id_refuses(self):
+        raw=fixture();raw['paths'][0].update(flags=9,source_index=0xffff,target_index=(1<<16)|2)
+        raw['modes'].append({'kind':3,'id':999,'adapter':[7,0],'path_size':[1920,1080],'region':[0,0,1920,1080],'clip':[0,0,1920,1080]})
+        code(self,'WINDOWS_MODE_IDENTITY_MISMATCH',lambda:manifest(raw))
+    def test_desktop_image_endpoint_role_stays_unqualified(self):
+        for identity in (0,1):
+            with self.subTest(identity=identity):
+                raw=fixture();raw['paths'][0].update(flags=9,source_index=0xffff,target_index=(1<<16)|2)
+                raw['modes'].append({'kind':3,'id':identity,'adapter':[7,0],'path_size':[1920,1080],'region':[0,0,1920,1080],'clip':[0,0,1920,1080]})
+                m=manifest(raw)
+                self.assertFalse(m['media_contract']['exact_crops_available'])
+                self.assertIsNone(m['displays'][0]['crop_contract'])
+                self.assertIn('WINDOWS_DESKTOP_IMAGE_IDENTITY_ROLE_UNQUALIFIED',m['capture']['source_errors'])
+    def test_desktop_image_cross_adapter_pair_cannot_be_mixed(self):
+        for image_adapter,identity,accepted in [([7,0],0,True),([8,0],1,True),([7,0],1,False),([8,0],0,False),([9,0],0,False)]:
+            with self.subTest(adapter=image_adapter,identity=identity):
+                raw=fixture();raw['paths'][0].update(flags=9,source_index=0xffff,target_index=(1<<16)|2,target_adapter=[8,0]);raw['modes'][1]['adapter']=[8,0]
+                raw['modes'].append({'kind':3,'id':identity,'adapter':image_adapter,'path_size':[1920,1080],'region':[0,0,1920,1080],'clip':[0,0,1920,1080]})
+                if accepted:
+                    self.assertFalse(manifest(raw)['media_contract']['exact_crops_available'])
+                else:
+                    code(self,'WINDOWS_MODE_IDENTITY_MISMATCH',lambda:manifest(raw))
     def test_virtual_image_missing_withholds_exact_crop(self):
         raw=fixture();raw['paths'][0].update(flags=9,source_index=0xffff,target_index=(1<<16)|0xffff)
         m=manifest(raw);self.assertFalse(m['media_contract']['exact_crops_available']);self.assertIsNone(m['displays'][0]['crop_contract'])
