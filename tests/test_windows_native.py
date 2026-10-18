@@ -118,7 +118,7 @@ class WindowsABI(unittest.TestCase):
         for forbidden in ['GetWindowText','GetClassName','GetWindowThreadProcessId','GetDC(','BitBlt','PrintWindow','SetDisplayConfig','ChangeDisplaySettings','SetWindowPos','ShowWindow','CreateWindow','OpenProcess','RegOpenKey','DwmSetWindowAttribute']:
             self.assertNotIn(forbidden,text)
 
-def structural_summary(raw):
+def structural_summary(raw,query_flags=n.FLAGS):
     """CI diagnostic only: bounded flags/indexes/types, never native identities."""
     from blueprint.windows import OUTPUT_LIMIT,MAX_PATHS,MAX_MODES
     if not isinstance(raw,str) or len(raw.encode('utf-8',errors='replace'))>OUTPUT_LIMIT:
@@ -131,12 +131,109 @@ def structural_summary(raw):
     if not isinstance(paths,list) or not isinstance(modes,list):
         return {'status':'STRUCTURAL_RESPONSE_UNAVAILABLE'}
     def number(v):return v if type(v) is int and 0<=v<=0xffffffff else None
-    return {'status':'STRUCTURAL_ONLY_NOT_CAPTURE_ACCEPTANCE','query_flags':n.FLAGS,
+    return {'status':'STRUCTURAL_ONLY_NOT_CAPTURE_ACCEPTANCE','query_flags':query_flags,
       'path_count':len(paths),'mode_count':len(modes),
       'truncated':len(paths)>MAX_PATHS or len(modes)>MAX_MODES,
       'paths':[{key:number(item.get(key)) if isinstance(item,dict) else None
         for key in ('flags','source_index','target_index')} for item in paths[:MAX_PATHS]],
       'mode_types':[number(item.get('kind')) if isinstance(item,dict) else None for item in modes[:MAX_MODES]]}
+
+def endpoint_matches(raw,path,index,role):
+    """Diagnostic boolean only; never interpret/accept geometry through it."""
+    if type(index) is not int or not 0<=index<len(raw.get('modes',[])):return False
+    value=raw['modes'][index]
+    if not isinstance(value,dict) or not isinstance(path,dict):return False
+    def identity(adapter,identifier):
+        return (isinstance(adapter,list) and len(adapter)==2 and type(adapter[0]) is int
+          and 0<=adapter[0]<=0xffffffff and type(adapter[1]) is int and -(2**31)<=adapter[1]<2**31
+          and type(identifier) is int and 0<=identifier<=0xffffffff)
+    a=path.get(role+'_adapter');i=path.get(role+'_id');ma=value.get('adapter');mi=value.get('id')
+    return (identity(a,i) and identity(ma,mi) and a==ma and i==mi
+      and type(value.get('kind')) is int and value['kind']==(1 if role=='source' else 2))
+
+def diagnostic_sample(raw,flags):
+    sample=structural_summary(json.dumps(raw),query_flags=flags)
+    if sample.get('status')!='STRUCTURAL_ONLY_NOT_CAPTURE_ACCEPTANCE':return sample
+    for source,out in zip(raw['paths'],sample['paths']):
+        for role in ('source','target'):
+            index=out[role+'_index']
+            out[role+'_full_word_matches_endpoint']=endpoint_matches(raw,source,index,role)
+            out[role+'_high_word_matches_endpoint']=endpoint_matches(raw,source,index>>16,role) if index is not None else False
+    return sample
+
+def comparative_structure(api):
+    """CI child only: independent reads, no geometry acceptance or fallback.
+
+    Production FLAGS and parser stay unchanged. The temporary query flag is
+    restored, as is this child's own DPI context, on success and every error.
+    """
+    result={'status':'DIAGNOSTIC_ONLY_NOT_CAPTURE_ACCEPTANCE','comparison':'SEPARATE_NONATOMIC_READS',
+      'queries':[],'ctypes_offsets':{key:{field:getattr(cls,field).offset for field,_ in cls._fields_}
+        for key,cls in [('PathSource',n.PathSource),('PathTarget',n.PathTarget),('DisplayPath',n.DisplayPath),('Mode',n.Mode)]},
+      'byteorder':sys.byteorder}
+    old_flags=n.FLAGS;old=api.enter_dpi()
+    try:
+        if not api.verify_dpi():raise CaptureError('WINDOWS_DPI_CONTEXT_UNAVAILABLE')
+        for flags in (0x12,0x2):
+            n.FLAGS=flags
+            try:
+                paths,modes=api.displays()
+                result['queries'].append(diagnostic_sample({'status':'CAPTURED','paths':paths,'modes':modes},flags))
+            except CaptureError as error:
+                result['queries'].append({'status':'QUERY_UNAVAILABLE','query_flags':flags,
+                  'code':error.code if error.code in n.ERROR_CODES else 'WINDOWS_DISPLAY_QUERY_FAILED'})
+        if not api.verify_dpi():raise CaptureError('WINDOWS_DPI_CONTEXT_UNAVAILABLE')
+        return result
+    finally:
+        n.FLAGS=old_flags
+        api.restore_dpi(old)
+
+def comparative_child():
+    try:
+        n.validate_abi();result=comparative_structure(n.Native())
+    except CaptureError as error:
+        result={'status':'DIAGNOSTIC_UNAVAILABLE','code':error.code if error.code in n.ERROR_CODES else 'WINDOWS_DISPLAY_QUERY_FAILED'}
+    except Exception:result={'status':'DIAGNOSTIC_UNAVAILABLE','code':'WINDOWS_DISPLAY_QUERY_FAILED'}
+    print(json.dumps(result,separators=(',',':'),allow_nan=False))
+
+def read_comparison(query):
+    # Same bounded child runner as production, but a separate diagnostic-only
+    # entry point. Reject unexpected fields/shapes; no diagnostic can alter the
+    # main capture result or satisfy the native gate.
+    try:
+        raw=query(timeout=2,limit=65536,command=[sys.executable,'-B',str(Path(__file__).resolve()),'--structural-compare'])
+        value=json.loads(raw)
+        if not isinstance(value,dict):raise ValueError()
+        if value.get('status')=='DIAGNOSTIC_UNAVAILABLE':
+            if set(value)!={'status','code'} or value['code'] not in n.ERROR_CODES:raise ValueError()
+            return value
+        if set(value)!={'status','comparison','queries','ctypes_offsets','byteorder'}:raise ValueError()
+        if value['status']!='DIAGNOSTIC_ONLY_NOT_CAPTURE_ACCEPTANCE' or value['comparison']!='SEPARATE_NONATOMIC_READS':raise ValueError()
+        if value['byteorder'] not in ('little','big'):raise ValueError()
+        expected={key:{field:getattr(cls,field).offset for field,_ in cls._fields_}
+          for key,cls in [('PathSource',n.PathSource),('PathTarget',n.PathTarget),('DisplayPath',n.DisplayPath),('Mode',n.Mode)]}
+        if value['ctypes_offsets']!=expected:raise ValueError()
+        if not isinstance(value['queries'],list) or len(value['queries'])!=2:raise ValueError()
+        for flags,item in zip((18,2),value['queries']):
+            if not isinstance(item,dict) or type(item.get('query_flags')) is not int or item['query_flags']!=flags:raise ValueError()
+            if item.get('status')=='QUERY_UNAVAILABLE':
+                if set(item)!={'status','query_flags','code'} or item['code'] not in n.ERROR_CODES:raise ValueError()
+                continue
+            if set(item)!={'status','query_flags','path_count','mode_count','truncated','paths','mode_types'}:raise ValueError()
+            if item['status']!='STRUCTURAL_ONLY_NOT_CAPTURE_ACCEPTANCE' or type(item['truncated']) is not bool:raise ValueError()
+            if any(type(item[key]) is not int or not 0<=item[key]<=2**32-1 for key in ('path_count','mode_count')):raise ValueError()
+            if not isinstance(item['paths'],list) or len(item['paths'])>64 or not isinstance(item['mode_types'],list) or len(item['mode_types'])>192:raise ValueError()
+            def number(v):return v is None or type(v) is int and 0<=v<=0xffffffff
+            if not all(number(kind) for kind in item['mode_types']):raise ValueError()
+            for path in item['paths']:
+                numeric={'flags','source_index','target_index'}
+                boolean={role+'_'+word+'_word_matches_endpoint' for role in ('source','target') for word in ('full','high')}
+                if not isinstance(path,dict) or set(path)!=numeric|boolean:raise ValueError()
+                if not all(number(path[k]) for k in numeric) or not all(type(path[k]) is bool for k in boolean):raise ValueError()
+        return value
+    except CaptureError as error:
+        return {'status':'DIAGNOSTIC_UNAVAILABLE','code':error.code if error.code in ('CAPTURE_TIMEOUT','SOURCE_OUTPUT_LIMIT') else 'WINDOWS_DISPLAY_QUERY_FAILED'}
+    except Exception:return {'status':'DIAGNOSTIC_UNAVAILABLE','code':'STRUCTURAL_RESPONSE_UNAVAILABLE'}
 
 class NativeReceiptDiagnostics(unittest.TestCase):
     def test_structural_summary_excludes_identity_geometry_and_canary_fields(self):
@@ -190,6 +287,96 @@ class NativeReceiptDiagnostics(unittest.TestCase):
         self.assertEqual(exit_code,2);self.assertEqual(result['native_capture'],'UNQUALIFIED_INCOMPLETE_OBSERVATION')
         self.assertEqual(result['structural_diagnostics']['queries_with_response'],2)
 
+class WindowsComparisonDiagnostics(unittest.TestCase):
+    def api(self):
+        from test_windows_platform import fixture
+        class DiagnosticAPI(Fake):
+            def displays(self):
+                self.events.append(('flags',n.FLAGS))
+                raw=fixture()
+                if n.FLAGS==18:
+                    raw['paths'][0].update(source_index=0x1ffff,target_index=0xffff)
+                    raw['modes'].reverse()
+                return raw['paths'],raw['modes']
+        return DiagnosticAPI()
+    def test_ci_observed_packed_looking_words_do_not_override_flags(self):
+        from test_windows_platform import fixture
+        from blueprint.windows import parse
+        raw=fixture();raw['modes'].reverse();raw['paths'][0].update(source_index=0x1ffff,target_index=0xffff)
+        with self.assertRaises(CaptureError) as error:parse(raw)
+        self.assertEqual(error.exception.code,'WINDOWS_MODE_INDEX_INVALID')
+        result=diagnostic_sample(raw,18)['paths'][0]
+        self.assertFalse(result['source_full_word_matches_endpoint']);self.assertTrue(result['source_high_word_matches_endpoint'])
+        self.assertFalse(result['target_full_word_matches_endpoint']);self.assertTrue(result['target_high_word_matches_endpoint'])
+    def test_comparison_is_separate_and_restores_flags_and_context(self):
+        api=self.api();before=n.FLAGS;result=comparative_structure(api)
+        self.assertEqual([r['query_flags'] for r in result['queries']],[18,2])
+        self.assertEqual([r['mode_types'] for r in result['queries']],[[2,1],[1,2]])
+        self.assertEqual(api.events,['enter','verify',('flags',18),('flags',2),'verify',('restore',123)])
+        self.assertEqual(n.FLAGS,before)
+        self.assertEqual(result['ctypes_offsets']['PathSource']['index'],12)
+        self.assertEqual(result['ctypes_offsets']['PathTarget']['index'],12)
+        self.assertEqual(result['ctypes_offsets']['DisplayPath']['flags'],68)
+        self.assertEqual(result['ctypes_offsets']['Mode']['value'],16)
+        for private in ('PRIVATE','source_adapter','target_adapter','source_id','target_id','_gdi','rect','987654321123'):
+            self.assertNotIn(private,json.dumps(result))
+    def test_unavailable_legacy_query_is_recorded_and_not_retried(self):
+        api=self.api();original=api.displays
+        def displays():
+            if n.FLAGS==2:raise CaptureError('WINDOWS_DESKTOP_ACCESS_UNAVAILABLE')
+            return original()
+        api.displays=displays;result=comparative_structure(api)
+        self.assertEqual(result['queries'][1],{'status':'QUERY_UNAVAILABLE','query_flags':2,'code':'WINDOWS_DESKTOP_ACCESS_UNAVAILABLE'})
+        self.assertEqual(n.FLAGS,18);self.assertEqual(api.events[-1],('restore',123))
+    def test_unexpected_failure_restores_context_and_flags(self):
+        api=self.api();api.displays=lambda:(_ for _ in ()).throw(RuntimeError('PRIVATE'))
+        with self.assertRaises(RuntimeError):comparative_structure(api)
+        self.assertEqual(n.FLAGS,18);self.assertEqual(api.events[-1],('restore',123))
+    def test_dpi_failure_never_queries(self):
+        api=self.api();api.verified=False
+        with self.assertRaises(CaptureError):comparative_structure(api)
+        self.assertNotIn(('flags',18),api.events);self.assertEqual(api.events[-1],('restore',123))
+    def test_fixed_memory_offsets_decode_full_uint32_without_bitfields(self):
+        # Exercise each raw WORD position independently of ctypes assignment.
+        value=n.DisplayPath();data=bytearray(C.sizeof(value))
+        for offset,number in [(12,0x0001ffff),(32,0x0000ffff),(68,1)]:
+            data[offset:offset+4]=number.to_bytes(4,'little')
+        C.memmove(C.addressof(value),bytes(data),len(data))
+        self.assertEqual(value.source.index,131071);self.assertEqual(value.target.index,65535);self.assertEqual(value.flags,1)
+        self.assertFalse(any(len(field)!=2 for cls in (n.PathSource,n.PathTarget,n.DisplayPath) for field in cls._fields_))
+    def test_endpoint_identity_mismatch_and_bool_are_not_matches(self):
+        from test_windows_platform import fixture
+        for identity in (True,None,'PRIVATE',999):
+            raw=fixture();raw['modes'][0]['id']=identity
+            self.assertFalse(endpoint_matches(raw,raw['paths'][0],0,'source'))
+        raw=fixture();raw['modes'][0]['adapter']=[999,0]
+        self.assertFalse(endpoint_matches(raw,raw['paths'][0],0,'source'))
+    def test_diagnostic_child_has_fixed_bound_and_no_private_payload(self):
+        receipt=comparative_structure(self.api());calls=[]
+        def query(**kwargs):calls.append(kwargs);return json.dumps(receipt)
+        self.assertEqual(read_comparison(query),receipt)
+        self.assertEqual(calls,[{'timeout':2,'limit':65536,'command':[sys.executable,'-B',str(Path(__file__).resolve()),'--structural-compare']}])
+        receipt['queries'][0]['paths'][0]['private']='PRIVATE'
+        self.assertEqual(read_comparison(lambda **_:json.dumps(receipt)),{'status':'DIAGNOSTIC_UNAVAILABLE','code':'STRUCTURAL_RESPONSE_UNAVAILABLE'})
+    def test_diagnostic_timeout_and_invalid_payload_cannot_leak(self):
+        for error in ('CAPTURE_TIMEOUT','SOURCE_OUTPUT_LIMIT'):
+            def query(**_):raise CaptureError(error)
+            self.assertEqual(read_comparison(query),{'status':'DIAGNOSTIC_UNAVAILABLE','code':error})
+        for raw in ['PRIVATE','[]','{"status":"DIAGNOSTIC_UNAVAILABLE","code":"PRIVATE"}']:
+            self.assertNotIn('PRIVATE',json.dumps(read_comparison(lambda **_:raw)))
+    def test_matching_diagnostics_never_change_failed_native_gate(self):
+        from test_windows_platform import fixture
+        raw=fixture();raw['modes'].reverse();raw['paths'][0].update(source_index=0x1ffff,target_index=0xffff)
+        comparison=comparative_structure(self.api());calls=[]
+        def query(**kwargs):
+            calls.append(kwargs)
+            return json.dumps(comparison if 'command' in kwargs else raw)
+        with TemporaryDirectory() as tmp,patch.object(sys,'platform','win32'),patch('blueprint.windows.bounded_worker',side_effect=query),redirect_stdout(io.StringIO()):
+            output=Path(tmp)/'result.json';self.assertEqual(native_probe(output),2);result=json.loads(output.read_text())
+        self.assertEqual(result['code'],'WINDOWS_MODE_INDEX_INVALID');self.assertEqual(result['native_capture'],'UNQUALIFIED_UNAVAILABLE')
+        self.assertEqual(result['query_comparison_diagnostic'],comparison);self.assertEqual(len(calls),2)
+        self.assertNotIn('PRIVATE',json.dumps(result))
+
 def native_probe(destination):
     """CI-only invocation: actual read-only data or nonzero unqualified result."""
     from blueprint.windows import coherent_capture,bounded_worker
@@ -215,7 +402,9 @@ def native_probe(destination):
         if result['display_geometry']=='COMPLETE' and result['windows']=='CAPTURED_TOPLEVEL_WINDOWS' and result['frame_bounds_count']>0 and result['coherence']=='TWO_MATCHING_SNAPSHOTS' and not result['source_errors']:
             result['native_capture']='PASS_BOUNDED_RUNNER_READONLY';exit_code=0
         else:result['native_capture']='UNQUALIFIED_INCOMPLETE_OBSERVATION'
-    except CaptureError as error:result.update(native_capture='UNQUALIFIED_UNAVAILABLE',code=error.code)
+    except CaptureError as error:
+        result.update(native_capture='UNQUALIFIED_UNAVAILABLE',code=error.code)
+        if error.code=='WINDOWS_MODE_INDEX_INVALID':result['query_comparison_diagnostic']=read_comparison(bounded_worker)
     except Exception:result.update(native_capture='FAILED',code='NATIVE_PROBE_UNEXPECTED_FAILURE')
     result['structural_diagnostics']={'queries_with_response':query_count,'last_responses':responses}
     Path(destination).write_text(json.dumps(result,indent=2)+'\n',encoding='utf-8')
@@ -223,5 +412,6 @@ def native_probe(destination):
     return exit_code
 
 if __name__=='__main__':
+    if len(sys.argv)==2 and sys.argv[1]=='--structural-compare':comparative_child();sys.exit(0)
     if len(sys.argv)==3 and sys.argv[1]=='--native-readonly':sys.exit(native_probe(sys.argv[2]))
     unittest.main(verbosity=2)
