@@ -14,12 +14,17 @@ def main(argv=None):
     parser.add_argument('--metadata-only',action='store_true',help='Print allowlisted canonical data without authoring a PDF')
     args=parser.parse_args(argv)
     try:
+        family=platform.system(); session=os.environ.get('XDG_SESSION_TYPE','unknown') if family=='Linux' else 'windows_desktop' if family=='Windows' else 'unknown'
         if args.fixture:
             if args.fixture.stat().st_size>262144: raise CaptureError('SOURCE_OUTPUT_LIMIT')
             snapshot=parse(args.fixture.read_text(encoding='utf-8')); snapshot['coherence']={'status':'SYNTHETIC_FIXTURE_NOT_HOST_CAPTURE'}
-        elif platform.system()!='Linux': raise CaptureError(platform.system().upper()+'_NATIVE_ADAPTER_NOT_IMPLEMENTED')
+            family,session='Linux','x11'
+        elif family=='Windows':
+            from .windows import coherent_capture as windows_capture
+            snapshot=windows_capture()
+        elif family!='Linux': raise CaptureError(family.upper()+'_NATIVE_ADAPTER_NOT_IMPLEMENTED')
         else: snapshot=coherent_capture(window_query=window_query)
-        result=normalize(snapshot,datetime.now(timezone.utc).isoformat())
+        result=normalize(snapshot,datetime.now(timezone.utc).isoformat(),os_family=family,session=session)
         if args.metadata_only:
             print(json.dumps(result,indent=2)); return 0
         from .export import write_bundle

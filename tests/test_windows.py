@@ -38,7 +38,8 @@ class Windows(unittest.TestCase):
         with self.assertRaises(CaptureError):normalize(snap,STAMP)
     def test_unknown_platforms_never_claim_implementation_or_permission(self):
         for system,session,key in [('Windows','','windows'),('Darwin','','darwin'),('Linux','wayland','linux_wayland')]:
-            c=capabilities(system,session);self.assertEqual(c['current'],key);self.assertEqual(c['adapters'][key]['windows'],'NOT_IMPLEMENTED')
+            c=capabilities(system,session);self.assertEqual(c['current'],key)
+            self.assertEqual(c['adapters'][key]['windows'],'IMPLEMENTED_CANDIDATE_NATIVE_UNQUALIFIED' if key=='windows' else 'NOT_IMPLEMENTED')
     def test_full_pair_coherence_and_window_instability_preserve_qualified_displays(self):
         count=[0]
         def moving(**kwargs):count[0]+=1;return windows(client_rect=[count[0],0,100,100])

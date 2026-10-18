@@ -74,7 +74,7 @@ def normalize(snapshot, timestamp, os_family='Linux', session='x11'):
     width=max(r[0]+r[2] for r in rectangles)-left; height=max(r[1]+r[3] for r in rectangles)-top
     if width > LIMIT or height > LIMIT: raise CaptureError('CANVAS_LIMIT')
     unit = snapshot.get('desktop_unit','x11_root_framebuffer_px')
-    if unit not in ['x11_root_framebuffer_px','logical_px','logical_points']:
+    if unit not in ['x11_root_framebuffer_px','logical_px','logical_points','windows_virtual_desktop_physical_px']:
         raise CaptureError('UNKNOWN_COORDINATE_SPACE')
     displays=[]; crtc_groups={}
     for i,(d,r) in enumerate(zip(ordered,rectangles),1):
@@ -123,9 +123,12 @@ def normalize(snapshot, timestamp, os_family='Linux', session='x11'):
             'crop_contract':{'master_xywh':normalized,'master_unit':unit,'output_size_px':oriented,'rule':'Crop first in the shared canvas coordinate space, then resample that local crop to this output. Never scale global positions by per-display UI scale.','rotation':'Already upright in oriented_output_px; do not rotate twice.'} if mapping else None,
             'physical_placement':{'bezel_mm':None,'gap_mm':None,'angle_deg':None,'depth_mm':None,'reason':'Not observable from OS desktop placement.'}
         }
+        if unit=='windows_virtual_desktop_physical_px':
+            from .windows_geometry import display_fields
+            display.update(display_fields(d,[left,top]))
         displays.append(display)
         if d.get('_crtc') is not None: crtc_groups.setdefault(d['_crtc'],[]).append(native_id)
-    groups=[{'id':f'clone-{i+1}','members':members,'evidence':'Same active XRandR CRTC; not inferred from overlap.'} for i,members in enumerate(v for v in crtc_groups.values() if len(v)>1)]
+    groups=[{'id':f'clone-{i+1}','members':members,'evidence':('Same CCD adapter/source surface; not inferred from overlap.' if unit=='windows_virtual_desktop_physical_px' else 'Same active XRandR CRTC; not inferred from overlap.')} for i,members in enumerate(v for v in crtc_groups.values() if len(v)>1)]
     normalized_rects=[d['normalized_rect']['xywh'] for d in displays]
     mask,holes=partition(normalized_rects,[0,0,width,height])
     overlaps=[]
@@ -135,11 +138,14 @@ def normalize(snapshot, timestamp, os_family='Linux', session='x11'):
             if right>x and bottom>y: overlaps.append({'displays':[displays[i]['id'],displays[j]['id']],'xywh':[x,y,right-x,bottom-y],'relation':'confirmed_clone' if any(displays[i]['id'] in g['members'] and displays[j]['id'] in g['members'] for g in groups) else 'overlap_only_mirroring_unknown'})
     g=gcd(width,height)
     mapping_complete=all(d['mapping_status']=='EXACT_DIGITAL_AFFINE' for d in displays)
-    from .window_geometry import normalize_windows
+    if unit=='windows_virtual_desktop_physical_px':
+        from .windows_geometry import normalize_windows
+    else:
+        from .window_geometry import normalize_windows
     from .platforms import capabilities
     window_geometry=normalize_windows(snapshot.get('windows'),{'source_origin':[left,top],'unit':unit},displays)
     return {
-        'schema_version':SCHEMA_VERSION,'tool_version':'0.2.0-proposal',
+        'schema_version':'1.2.0' if unit=='windows_virtual_desktop_physical_px' else SCHEMA_VERSION,'tool_version':'0.3.0-proposal',
         'platform_capabilities':capabilities(os_family,session),
         'capture':{'utc':timestamp,'os_family':os_family,'session_protocol':session,'backend':snapshot.get('backend','fixture'),
                    'overall_completeness':'PARTIAL','display_geometry':'COMPLETE' if mapping_complete else 'INCOMPLETE',
@@ -156,7 +162,7 @@ def normalize(snapshot, timestamp, os_family='Linux', session='x11'):
           'mask_rule':'Only active_mask_disjoint_rects are visible. unused_canvas_rects are digital holes, not measured physical gaps. Duplicate clone crops must not enlarge the canvas.',
           'motion_rule':'Use one shared frame timeline, duration and fps for every output. Locked camera and low motion are defaults; codec, decode headroom, playback sync and seamless looping are NOT_TESTED.',
           'focus_rule':'Keep critical subjects within an individual display rectangle; seams and unused areas should contain expendable scenery. Window rectangles, when captured, are temporary composition hints; actual visible or privacy-safe pixels remain unknown.'},
-        'remaining_gates':['Windows native collector NOT_IMPLEMENTED','macOS native collector NOT_IMPLEMENTED','Wayland native collector NOT_IMPLEMENTED','Window opacity/occlusion and unmanaged surfaces NOT_QUALIFIED','Signed portable packaging NOT_BUILT','PDF ingestion by target AI NOT_TESTED','Generated media fit/crop/video export NOT_IMPLEMENTED','Actual synchronized wallpaper playback NOT_TESTED']
+        'remaining_gates':['Windows collector IMPLEMENTED_CANDIDATE; native device qualification NOT_RUN','macOS native collector NOT_IMPLEMENTED','Wayland native collector NOT_IMPLEMENTED','Window opacity/occlusion and unmanaged surfaces NOT_QUALIFIED','Signed portable packaging NOT_BUILT','PDF ingestion by target AI NOT_TESTED','Generated media fit/crop/video export NOT_IMPLEMENTED','Actual synchronized wallpaper playback NOT_TESTED']
     }
 
 def canonical_json(manifest):
